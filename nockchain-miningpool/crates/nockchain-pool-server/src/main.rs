@@ -13,7 +13,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 use blake3;
 // 引入nockchain核心库，用于集成nockchain节点
-use kernels::miner::KERNEL;
+use kernels::dumb::KERNEL;
 use nockapp::kernel::boot;
 // 移除未使用的导入
 use nockapp::nockapp::driver::{NockAppHandle, PokeResult};
@@ -140,11 +140,11 @@ impl ThreadSafeNockAppHandle {
     }
     
     // 封装poke方法，确保线程安全
-    async fn safe_poke(&self, wire: nockapp::wire::WireRepr, poke_slab: NounSlab) -> Result<PokeResult, anyhow::Error> {
+    async fn safe_poke(&self, _wire: nockapp::wire::WireRepr, _poke_slab: NounSlab) -> Result<PokeResult, anyhow::Error> {
         // 在单线程上下文中执行，避免原始指针跨线程
         let handle_clone = self.handle.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let handle = handle_clone.lock().unwrap();
+            let _handle = handle_clone.lock().unwrap();
             
             // 简化版：返回模拟结果
             Ok::<PokeResult, anyhow::Error>(PokeResult::Ack)
@@ -534,8 +534,9 @@ async fn main() -> Result<()> {
     // 加载.env文件 | Load .env file
     dotenv().ok();
     
-    // 设置环境变量以禁止跟踪系统初始化
-    // Set environment variable to disable tracing initialization
+    // 设置环境变量以禁止跟踪系统初始化，并只显示错误级别的日志
+    // Set environment variables to disable tracing initialization and only show error level logs
+    std::env::set_var("RUST_LOG", "error");  // 只显示错误级别日志
     std::env::set_var("TRACING_DISABLED", "1");
     
     // 安全地尝试初始化跟踪系统 | Safely try to initialize tracing
@@ -603,6 +604,10 @@ async fn main() -> Result<()> {
         prover_hot_state.as_slice()
     ).await.expect("Failed to initialize nockchain");
     
+    // 注意：NockApp不能被克隆，因此我们只创建服务
+    // 并使用服务的方式来与nockapp交互
+    info!("准备初始化矿池服务... | Preparing to initialize mining pool service...");
+
     // 设置挖矿公钥和启用挖矿 - 以线程安全的方式
     info!("配置挖矿公钥和启用挖矿... | Configuring mining pubkey and enabling mining...");
     let service = MiningPoolService::new(nockapp);

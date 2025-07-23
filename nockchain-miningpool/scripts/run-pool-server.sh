@@ -1,8 +1,9 @@
 #!/bin/bash
 
-# 设置环境变量以禁止跟踪系统初始化
-export RUST_LOG=info
+# 设置环境变量以禁止跟踪系统初始化并限制日志级别
+export RUST_LOG=error
 export TRACING_DISABLED=1
+export NOCKVM_DISABLE_TRACE=1  # 禁用nockvm跟踪
 
 # 确保加载环境变量
 if [ -f .env ]; then
