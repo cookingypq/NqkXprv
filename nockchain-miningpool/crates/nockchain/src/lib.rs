@@ -1,6 +1,8 @@
 pub mod config;
 pub mod mining;
 pub mod setup;
+#[cfg(feature = "pool_client")]
+pub mod pool_client; // 添加矿池客户端模块 | Add pool client module
 
 use std::error::Error;
 use std::fs;

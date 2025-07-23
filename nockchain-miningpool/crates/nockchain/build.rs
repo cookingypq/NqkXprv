@@ -1,14 +1,21 @@
-fn main() {
-    // List of Bazel built-in stamping variables to embed
-    let bazel_vars = [
-        "BUILD_EMBED_LABEL", "BUILD_HOST", "BUILD_USER", "BUILD_TIMESTAMP",
-        "FORMATTED_DATE",
-        // You can add more built-in variables or your own STABLE_ variables as needed
-    ];
+use std::error::Error;
+use vergen::EmitBuilder;
 
-    // Set cargo:rustc-env for each variable that exists
-    for var in bazel_vars {
-        let value = std::env::var(var).unwrap_or_else(|_| "unknown".to_string());
-        println!("cargo:rustc-env={var}={value}");
-    }
+fn main() -> Result<(), Box<dyn Error>> {
+    // 使用新的vergen 8.x API
+    // Using new vergen 8.x API
+    EmitBuilder::builder()
+        .git_sha(true)
+        .git_commit_timestamp()
+        .emit()?;
+    
+    // 新增编译protobuf文件为Rust代码 | Add compilation of protobuf file to Rust code
+    // 仅当启用了矿池模式特性时才编译proto文件 | Only compile proto files when pool mode feature is enabled
+    #[cfg(feature = "pool_client")]
+    tonic_build::compile_protos("proto/pool.proto")?;
+    
+    #[cfg(feature = "pool_client")]
+    println!("cargo:rerun-if-changed=proto/pool.proto");
+    
+    Ok(())
 }

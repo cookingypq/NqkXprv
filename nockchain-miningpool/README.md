@@ -1,296 +1,131 @@
-# Nockchain
+# Nockchain 矿池系统
 
-**Nockchain is a lightweight blockchain for heavyweight verifiable applications.**
+## 简介
 
+Nockchain 矿池系统是一个为大规模矿工集群设计的高效挖矿解决方案。它将区块链同步与PoW计算任务分离，使矿工机器能够专注于计算，从而大幅提升整体挖矿效率。
 
-We believe the future of blockchains is lightweight trustless settlement of heavyweight verifiable computation. The only way to get there is by replacing verifiability-via-public-replication with verifiability-via-private-proving. Proving happens off-chain; verification is on-chain.
+本系统包含两个核心组件：
+- **矿池服务器 (`pool-server`)**：作为指挥中心，负责同步区块链、管理矿工和分发任务。一个矿场只需部署一个实例。
+- **矿工客户端 (`miner`)**：作为计算节点，负责执行PoW计算任务。可在任意多的机器上部署。
 
-*Nockchain is entirely experimental and many parts are unaudited. We make no representations or guarantees as to the behavior of this software.*
+## 快速开始
 
-
-## Setup
-
-Install `rustup` by following their instructions at: [https://rustup.rs/](https://rustup.rs/)
-
-Ensure you have these dependencies installed if running on Debian/Ubuntu:
-```
-sudo apt update
-sudo apt install clang llvm-dev libclang-dev make
-```
-Clone the repo and cd into it:
-```
-git clone https://github.com/zorp-corp/nockchain.git && cd nockchain
-```
-
-Copy the example environment file and rename it to `.env`:
-```
-cp .env_example .env
-```
-
-Install `hoonc`, the Hoon compiler:
-
-```
-make install-hoonc
-export PATH="$HOME/.cargo/bin:$PATH"
-```
-
-## Install Wallet
-
-After you've run the setup and build commands, install the wallet:
-
-```
-make install-nockchain-wallet
-export PATH="$HOME/.cargo/bin:$PATH"
-```
-
-See the nockchain-wallet [README](./crates/nockchain-wallet/README.md) for more information.
-
-
-## Install Nockchain
-
-After you've run the setup and build commands, install Nockchain:
-
-```
-make install-nockchain
-export PATH="$HOME/.cargo/bin:$PATH"
-```
-
-## Setup Keys
-
-To generate a new key pair:
-
-```
-nockchain-wallet keygen
-```
-
-This will print a new public/private key pair + chain code to the console, as well as the seed phrase for the private key.
-
-Now, copy the public key to the `.env` file:
-
-```
-MINING_PUBKEY=<public-key>
-```
-
-## Backup Keys
-
-To backup your keys, run:
-
-```
-nockchain-wallet export-keys
-```
-
-This will save your keys to a file called `keys.export` in the current directory.
-
-They can be imported later with:
-
-```
-nockchain-wallet import-keys --input keys.export
-```
-
-## Running Nodes
-
-Make sure your current directory is nockchain.
-
-To run a Nockchain node without mining.
-
-```
-bash ./scripts/run_nockchain_node.sh
-```
-
-To run a Nockchain node and mine to a pubkey:
-
-```
-bash ./scripts/run_nockchain_miner.sh
-```
-
-For launch, make sure you run in a fresh working directory that does not include a .data.nockchain file from testing.
-
-## FAQ
-
-### Can I use same pubkey if running multiple miners?
-
-Yes, you can use the same pubkey if running multiple miners.
-
-### How do I change the mining pubkey?
-
-Run `nockchain-wallet keygen` to generate a new key pair.
-
-If you are using the Makefile workflow, copy the public key to the `.env` file.
-
-### How do I run a testnet?
-To run a testnet on your machine, follow the same instructions as above, except use the fakenet
-scripts provided in the `scripts` directory.
-
-Here's how to set it up:
+### 构建
 
 ```bash
-Make sure you have the most up-to-date version of Nockchain installed.
+# 构建所有组件
+make release
 
-Inside of the nockchain directory:
-
-# Create directories for each instance
-mkdir fakenet-hub fakenet-node
-
-# Copy .env to each directory
-cp .env fakenet-hub/
-cp .env fakenet-node/
-
-# Run each instance in its own directory with .env loaded
-cd fakenet-hub && sh ../scripts/run_nockchain_node_fakenet.sh
-cd fakenet-node && sh ../scripts/run_nockchain_miner_fakenet.sh
+# 或者单独构建各组件
+make pool-server
+make miner
+make wallet
 ```
 
-The hub script is bound to a fixed multiaddr and the node script sets that multiaddr as an initial
-peer so that nodes have a way of discovering eachother initially.
+构建完成后，可执行文件将位于 `target/release/` 目录下。
 
-You can run multiple instances using `run_nockchain_miner_fakenet.sh`, just make sure that
-you are running them from different directories because the checkpoint data is located in the
-working directory of the script.
+### 部署流程
 
-### What are the networking requirements?
+1. **准备工作**
+   - 确保已构建 `pool-server`、`miner` 和 `nockchain-wallet` 三个可执行文件
+   - 选择一台机器作为矿池服务器
 
-Nockchain requires:
+2. **配置矿池服务器**
+   - 生成挖矿公钥
+     ```bash
+     ./nockchain-wallet keygen
+     ```
+   - 创建 `.env` 文件，内容如下：
+     ```
+     MINING_PUBKEY=<你生成的公钥>
+     RUST_LOG=info
+     POOL_SERVER_ADDRESS=0.0.0.0:7777
+     ```
 
-1. Internet.
-2. If you are behind a firewall, you need to specify the p2p ports to use and open them..
-   - Example: `nockchain --bind /ip4/0.0.0.0/udp/$PEER_PORT/quic-v1`
-3. **NAT Configuration (if you are behind one)**:
-   - If behind NAT, configure port forwarding for the peer port
-   - Use `--bind` to specify your public IP/domain
-   - Example: `nockchain --bind /ip4/1.2.3.4/udp/$PEER_PORT/quic-v1`
+3. **启动矿池服务器**
+   ```bash
+   ./scripts/start-pool-server.sh
+   ```
+   或者直接运行可执行文件：
+   ```bash
+   ./target/release/pool-server
+   ```
 
-### Why aren't Zorp peers connecting?
+4. **启动矿工客户端**
+   在每台矿机上，运行：
+   ```bash
+   ./scripts/start-miner.sh <矿池服务器IP> --threads <线程数>
+   ```
+   或者直接运行可执行文件：
+   ```bash
+   ./target/release/miner <矿池服务器IP> --threads <线程数>
+   ```
+   
+   例如：
+   ```bash
+   ./scripts/start-miner.sh 192.168.1.100 --threads 16
+   ```
 
-Common reasons for peer connection failures:
+### 验证系统运行状态
 
-1. **Network Issues**:
-   - Firewall blocking P2P port
-   - NAT not properly configured
-   - Incorrect bind address
+- **矿池服务器日志**：显示已连接矿工数量和工作提交情况
+- **矿工客户端日志**：显示连接状态、哈希率和提交工作的情况
 
-2. **Configuration Issues**:
-   - Invalid peer IDs
+## 脚本使用说明
 
-3. **Debug Steps**:
-   - Check logs for connection errors
-   - Verify port forwarding
-
-### What do outgoing connection failures mean?
-
-Outgoing connection failures can occur due to:
-
-1. **Network Issues**:
-   - Peer is offline
-   - Firewall blocking connection
-   - NAT traversal failure
-
-2. **Peer Issues**:
-   - Peer has reached connection limit
-   - Peer is blocking your IP
-
-3. **Debug Steps**:
-   - Check peer's status
-   - Verify network connectivity
-   - Check logs for specific error messages
-
-### How do I know if it's mining?
-
-You can check the logs for mining activity.
-
-If you see a line that looks like:
-
-```sh
-[%mining-on 12.040.301.481.503.404.506 17.412.404.101.022.637.021 1.154.757.196.846.835.552 12.582.351.418.886.020.622 6.726.267.510.179.724.279]
-```
-
-### How do I check block height?
-
-You can check the logs for a line like:
-
-```sh
-block Vo3d2Qjy1YHMoaHJBeuQMgi4Dvi3Z2GrcHNxvNYAncgzwnQYLWnGVE added to validated blocks at 2
-```
-
-That last number is the block height.
-
-### What do common errors mean?
-
-Common errors and their solutions:
-
-1. **Connection Errors**:
-   - `Failed to dial peer`: Network connectivity issues, you may still be connected though.
-   - `Handshake with the remote timed out`: Peer might be offline, not a fatal issue.
-
-### How do I check wallet balance?
-
-To check your wallet balance:
+### start-pool-server.sh
 
 ```bash
-# List all notes by pubkey
-nockchain-wallet --nockchain-socket ./nockchain.sock list-notes-by-pubkey -p <your-pubkey>
+./scripts/start-pool-server.sh [选项]
 ```
 
-### How do I configure logging levels?
+选项：
+- `-p, --pubkey KEY`：设置挖矿公钥
+- `-a, --address ADDR`：设置服务器监听地址 (默认: 0.0.0.0:7777)
+- `-l, --log LEVEL`：设置日志级别 (trace, debug, info, warn, error)
+- `-h, --help`：显示帮助信息
 
-To reduce logging verbosity, you can set the `RUST_LOG` environment variable before running nockchain:
+### start-miner.sh
 
 ```bash
-# Show only info and above
-RUST_LOG=info nockchain
-
-# Show only errors
-RUST_LOG=error nockchain
-
-# Show specific module logs (e.g. only p2p events)
-RUST_LOG=nockchain_libp2p_io=info nockchain
-
-# Multiple modules with different levels
-RUST_LOG=nockchain_libp2p_io=info,nockchain=warn nockchain
+./scripts/start-miner.sh <矿池服务器地址> [选项]
 ```
 
-Common log levels from most to least verbose:
-- `trace`: Very detailed debugging information
-- `debug`: Debugging information
-- `info`: General operational information
-- `warn`: Warning messages
-- `error`: Error messages
+选项：
+- `-t, --threads N`：使用的线程数 (默认: CPU核心数减1)
+- `-l, --log LEVEL`：设置日志级别 (trace, debug, info, warn, error)
+- `-h, --help`：显示帮助信息
 
-You can also add this to your `.env` file if you're running with the Makefile:
+## 常见问题
+
+### 矿工无法连接到矿池服务器
+
+- 确认矿池服务器已正确启动
+- 检查矿池服务器的IP地址是否正确
+- 确认防火墙设置允许7777端口的TCP连接
+
+### 矿工连接成功但未收到工作任务
+
+- 检查矿池服务器日志，确认其已成功同步区块链
+- 查看日志中是否有任何错误信息
+
+### 查看钱包余额
+
+使用`nockchain-wallet`工具查询余额：
+
+```bash
+./target/release/nockchain-wallet --nockchain-socket ./nockchain.sock list-notes-by-pubkey -p <您的公钥>
 ```
-RUST_LOG=info
-```
 
-### Troubleshooting Common Issues
+### 如何调整矿工性能
 
-1. **Node Won't Start**:
-   - Check port availability
-   - Verify .env configuration
-   - Check for existing .data.nockchain file
-   - Ensure proper permissions
+- 增减线程数可以直接影响挖矿性能，建议根据CPU核心数设置
+- 对于有大量物理核心的服务器，可以考虑每个物理核心运行一个线程
 
-2. **No Peers Connecting**:
-   - Verify port forwarding
-   - Check firewall settings
+## 系统架构
 
-3. **Mining Not Working**:
-   - Verify mining pubkey
-   - Check --mine flag
-   - Ensure peers are connected
-   - Check system resources
+- **矿池服务器**: 嵌入了完整的nockchain节点，负责区块链同步、生成挖矿任务和验证提交的结果
+- **矿工客户端**: 轻量级程序，仅包含PoW计算逻辑，不需要下载或验证区块链
+- **通信协议**: 基于gRPC，提供高效的双向通信机制
 
-4. **Wallet Issues**:
-   - Verify key import/export
-   - Check socket connection
-   - Ensure proper permissions
-
-# Contributing
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as below, without any additional terms or conditions.
-
-# License
-
-Licensed under either of
-
-Apache License, Version 2.0 (LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0)
-MIT license (LICENSE-MIT or https://opensource.org/licenses/MIT)
-at your option.
+这种架构设计使大规模矿场能够集中管理资源，提高算力利用率，同时降低每台矿机的硬件需求。

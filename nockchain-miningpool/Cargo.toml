@@ -13,6 +13,7 @@ members = [
     "crates/nockvm/rust/nockvm",
     "crates/nockchain-wallet",
     "crates/zkvm-jetpack",
+    "crates/nockchain-pool-server",
 ]
 
 resolver = "2"

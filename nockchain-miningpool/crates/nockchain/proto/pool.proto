@@ -1,0 +1,40 @@
+syntax = "proto3";
+package pool;
+
+// 服务定义 | Service definition
+service MiningPool {
+  // 矿工上线后，建立一个双向流，用于服务器推送任务和客户端上报心跳/状态 
+  // After miners come online, establish a bidirectional stream for server to push tasks and client to report heartbeats/status
+  rpc Subscribe(stream MinerStatus) returns (stream WorkOrder);
+  
+  // 矿工提交计算结果 | Miner submits computation results
+  rpc SubmitWork(WorkResult) returns (SubmitAck);
+}
+
+// 工作任务：包含PoW所需的一切 | Work task: contains everything needed for PoW
+message WorkOrder {
+  string work_id = 1;         // 任务ID | Task ID
+  bytes parent_hash = 2;      // 父区块哈希 | Parent block hash
+  bytes merkle_root = 3;      // 交易默克尔根 | Transaction merkle root
+  uint64 timestamp = 4;       // 时间戳 | Timestamp
+  bytes difficulty_target = 5; // 难度目标 | Difficulty target
+}
+
+// 计算结果 | Computation result
+message WorkResult {
+  string work_id = 1;        // 对应的任务ID | Corresponding task ID
+  bytes nonce = 2;           // 找到的Nonce | Found nonce
+  string miner_id = 3;       // 矿工ID（用于日志） | Miner ID (for logging)
+}
+
+// 提交确认 | Submission acknowledgement
+message SubmitAck {
+  bool success = 1; // 是否接受 | Whether accepted
+}
+
+// 矿工状态/心跳 | Miner status/heartbeat
+message MinerStatus {
+  string miner_id = 1;      // 矿工ID | Miner ID
+  uint32 threads = 2;       // 使用的线程数 | Number of threads used
+  // ... 未来可扩展算力等信息 | Future extensibility for hashrate information
+} 
