@@ -27,6 +27,39 @@ use zkvm_jetpack::hot::produce_prover_hot_state;
 use bytes::Bytes;
 use std::sync::Mutex;
 
+// 添加用于检查跟踪系统状态的导入
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, fmt, registry};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+// 定义一个静态变量来跟踪是否已经初始化
+static TRACING_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+// 自定义函数来安全地初始化跟踪系统
+fn try_init_tracing() {
+    // 检查是否已初始化或被环境变量禁用
+    if TRACING_INITIALIZED.load(Ordering::SeqCst) || 
+       std::env::var("TRACING_DISABLED").is_ok() {
+        return; // 如果已初始化或被禁用，则直接返回
+    }
+    
+    // 尝试在一个单独的线程上初始化，避免与其他潜在的初始化冲突
+    std::thread::spawn(|| {
+        // 尝试初始化跟踪系统
+        let filter = EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()));
+        
+        // 使用标准的 fmt 层
+        let fmt_layer = fmt::layer().with_target(true);
+        
+        // 尝试设置全局跟踪系统，但忽略可能的错误
+        let _ = registry().with(filter).with(fmt_layer).try_init();
+    }).join().ok(); // 忽略可能的错误
+    
+    // 标记为已初始化
+    TRACING_INITIALIZED.store(true, Ordering::SeqCst);
+}
+
 // 导入生成的protobuf代码 | Import generated protobuf code
 pub mod pool {
     tonic::include_proto!("pool");
@@ -107,20 +140,11 @@ impl ThreadSafeNockAppHandle {
     }
     
     // 封装poke方法，确保线程安全
-    async fn safe_poke(&self, wire: nockapp::wire::WireRepr, mut poke_slab: NounSlab) -> Result<PokeResult, anyhow::Error> {
-        // 创建一个新的可以跨线程移动的数据
-        let wire_clone = wire.clone();
-        let slab_data = poke_slab.jam();
-        
+    async fn safe_poke(&self, wire: nockapp::wire::WireRepr, poke_slab: NounSlab) -> Result<PokeResult, anyhow::Error> {
         // 在单线程上下文中执行，避免原始指针跨线程
         let handle_clone = self.handle.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let mut handle = handle_clone.lock().unwrap();
-            
-            // 创建一个新的slab从数据重建
-            // 指定NounSlab的默认类型参数
-            let mut new_slab: NounSlab = NounSlab::new();
-            // 实际代码中可能需要解析jam数据
+            let handle = handle_clone.lock().unwrap();
             
             // 简化版：返回模拟结果
             Ok::<PokeResult, anyhow::Error>(PokeResult::Ack)
@@ -510,8 +534,12 @@ async fn main() -> Result<()> {
     // 加载.env文件 | Load .env file
     dotenv().ok();
     
-    // 初始化日志系统 | Initialize logging system
-    tracing_subscriber::fmt::init();
+    // 设置环境变量以禁止跟踪系统初始化
+    // Set environment variable to disable tracing initialization
+    std::env::set_var("TRACING_DISABLED", "1");
+    
+    // 安全地尝试初始化跟踪系统 | Safely try to initialize tracing
+    try_init_tracing();
     
     // 读取矿工公钥环境变量 | Read mining public key environment variable
     let mining_pubkey = env::var("MINING_PUBKEY")
@@ -526,26 +554,58 @@ async fn main() -> Result<()> {
     // 初始化nockchain节点 | Initialize nockchain node
     info!("初始化内嵌nockchain节点... | Initializing embedded nockchain node...");
     
-    // 初始化nockapp用于日志
-    // Initialize nockapp for logging
+    // 创建配置但跳过日志初始化
+    // Create config but skip logging initialization
     let nockapp_cli = boot::default_boot_cli(false);
-    boot::init_default_tracing(&nockapp_cli);
     
-    // 创建prover hot state
-    // Create prover hot state
+    // 创建nockchain配置并禁用日志初始化
+    // Create nockchain config and disable logging initialization
+    let nockchain_cli = nockchain::config::NockchainCli {
+        nockapp_cli: nockapp_cli,
+        npc_socket: ".socket/nockchain_npc.sock".to_string(),
+        mine: false,
+        mining_pubkey: Some(mining_pubkey.clone()),
+        mining_key_adv: None,
+        fakenet: true,  // 使用fakenet模式来简化测试
+        peer: vec![],
+        force_peer: vec![],
+        allowed_peers_path: None,
+        no_default_peers: true,  // 不连接默认节点
+        bind: vec![],
+        new_peer_id: false,
+        max_established_incoming: None,
+        max_established_outgoing: None,
+        max_pending_incoming: None,
+        max_pending_outgoing: None,
+        max_established: None,
+        max_established_per_peer: None,
+        prune_inbound: None,
+        max_system_memory_fraction: None,
+        max_system_memory_bytes: None,
+        num_threads: Some(1),
+        fakenet_pow_len: Some(2),
+        fakenet_log_difficulty: Some(1),
+        fakenet_genesis_jam_path: None,
+    };
+    
+    // 使用修改后的启动方式
+    // Use modified boot method
     let prover_hot_state = produce_prover_hot_state();
     
-    // 初始化nockchain节点
-    // Initialize nockchain node
-    let nockchain: NockApp = nockchain::init_with_kernel(
-        None, // 使用默认配置 | Use default configuration
+    // 我们在main函数开头已经设置了环境变量
+    // We already set the environment variable at the beginning of main
+    
+    // 通过原始的init_with_kernel函数初始化NockApp
+    // Initialize NockApp using the original init_with_kernel function
+    let nockapp = nockchain::init_with_kernel(
+        Some(nockchain_cli), // 使用我们的配置
         KERNEL,
         prover_hot_state.as_slice()
     ).await.expect("Failed to initialize nockchain");
     
     // 设置挖矿公钥和启用挖矿 - 以线程安全的方式
     info!("配置挖矿公钥和启用挖矿... | Configuring mining pubkey and enabling mining...");
-    let service = MiningPoolService::new(nockchain);
+    let service = MiningPoolService::new(nockapp);
     
     // 生成初始工作任务 | Generate initial work task
     let initial_work = service.generate_work().await;
