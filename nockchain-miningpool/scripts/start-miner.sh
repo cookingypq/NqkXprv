@@ -6,7 +6,7 @@
 # 默认配置
 # Default configuration
 POOL_SERVER=""
-THREADS=$(( $(nproc) - 1 ))
+THREADS=$(( $(sysctl -n hw.logicalcpu) - 1 ))
 RUST_LOG=${RUST_LOG:-"info"}
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
