@@ -4060,10 +4060,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "blake3",
+ "bytes",
  "chrono",
  "clap",
  "dashmap 5.5.3",
  "dotenv",
+ "futures-core",
  "hex",
  "kernels",
  "nockapp",

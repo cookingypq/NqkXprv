@@ -21,7 +21,7 @@ use nockapp::nockapp::wire::Wire;
 use nockapp::NockApp;
 use nockapp::noun::slab::NounSlab;
 use nockapp::noun::AtomExt;
-use nockvm::noun::{Atom, D, T, YES};
+use nockvm::noun::{Atom, D, T};
 use nockvm_macros::tas;
 use zkvm_jetpack::hot::produce_prover_hot_state;
 use bytes::Bytes;
@@ -118,11 +118,12 @@ impl ThreadSafeNockAppHandle {
             let mut handle = handle_clone.lock().unwrap();
             
             // 创建一个新的slab从数据重建
-            let mut new_slab = NounSlab::new();
+            // 指定NounSlab的默认类型参数
+            let mut new_slab: NounSlab = NounSlab::new();
             // 实际代码中可能需要解析jam数据
             
             // 简化版：返回模拟结果
-            Ok(PokeResult::Ack)
+            Ok::<PokeResult, anyhow::Error>(PokeResult::Ack)
         }).await??;
         
         Ok(result)
@@ -189,7 +190,7 @@ impl MiningPoolService {
         
         info!("生成新工作任务 {} | Generating new work task {}", work_id, work_id);
         
-        let nockchain = self.nockchain.read().await;
+        let _nockchain = self.nockchain.read().await;
         
         // 从nockchain获取当前区块链状态
         // Get current blockchain state from nockchain
@@ -228,7 +229,7 @@ impl MiningPoolService {
         // Send request and wait for response, using thread-safe method
         let response = self.handle.safe_poke(MiningWire::SetPubKey.to_wire(), request_slab).await?;
         
-        // 修复：根据PokeResult枚举处理响应
+        // 直接处理响应，不需要调用root()方法
         match response {
             PokeResult::Ack => {
                 // 从handle中获取结果
@@ -264,13 +265,13 @@ impl MiningPoolService {
         // Build complete block data
         // 将Vec<u8>转换为Bytes进行传递
         let parent_hash_bytes = Bytes::from(work.parent_hash.clone());
-        let parent_hash_atom = AtomExt::from_bytes(&mut submit_slab, &parent_hash_bytes);
+        let parent_hash_atom = <Atom as AtomExt>::from_bytes(&mut submit_slab, &parent_hash_bytes);
         
         let merkle_root_bytes = Bytes::from(work.merkle_root.clone());
-        let merkle_root_atom = AtomExt::from_bytes(&mut submit_slab, &merkle_root_bytes);
+        let merkle_root_atom = <Atom as AtomExt>::from_bytes(&mut submit_slab, &merkle_root_bytes);
             
         let nonce_bytes = Bytes::from(work_result.nonce.clone());
-        let nonce_atom = AtomExt::from_bytes(&mut submit_slab, &nonce_bytes);
+        let nonce_atom = <Atom as AtomExt>::from_bytes(&mut submit_slab, &nonce_bytes);
             
         let submit_block = Atom::from_value(&mut submit_slab, "submit-block")
             .expect("Failed to create submit-block atom");
@@ -331,6 +332,9 @@ impl MiningPool for MiningPoolService {
             miner_id, threads, self.miners.len() + 1, miner_id, threads, self.miners.len() + 1
         );
         
+        // 额外克隆一份miner_id用于后续使用
+        let miner_id_for_response = miner_id.clone();
+        
         // 保存矿工连接 | Save miner connection
         self.miners.insert(
             miner_id.clone(),
@@ -355,7 +359,7 @@ impl MiningPool for MiningPoolService {
             // 矿工断开连接 | Miner disconnected
             miners.remove(&miner_id_clone);
             info!("矿工 {} 断开连接。总矿工数: {} | Miner {} disconnected. Total miners: {}", 
-                  miner_id_clone, miners.len(), miner_id_clone, miners.len());
+                  &miner_id_clone, miners.len(), &miner_id_clone, miners.len());
         });
         
         // 发送当前工作任务给新连接的矿工 | Send current work task to newly connected miner
@@ -371,7 +375,7 @@ impl MiningPool for MiningPoolService {
             
             if let Err(e) = tx.try_send(Ok(work)) {
                 error!("向矿工 {} 发送初始工作任务失败: {} | Failed to send initial work task to miner {}: {}", 
-                       miner_id, e, miner_id, e);
+                       &miner_id_for_response, e, &miner_id_for_response, e);
             }
         } else {
             // 如果没有当前工作，生成一个新的 | If there's no current work, generate a new one

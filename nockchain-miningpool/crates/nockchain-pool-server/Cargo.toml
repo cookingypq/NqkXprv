@@ -31,6 +31,8 @@ nockapp = { path = "../nockapp" }
 nockvm = { path = "../nockvm/rust/nockvm" }
 nockvm_macros = { path = "../nockvm/rust/nockvm_macros" }
 nockchain-libp2p-io = { path = "../nockchain-libp2p-io" }
+futures-core = "0.3"
+bytes = "1.0"
 
 [build-dependencies]
 tonic-build = "0.9" 
