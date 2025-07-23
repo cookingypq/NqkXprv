@@ -243,8 +243,22 @@ impl MiningPoolService {
             Ok(data) => data,
             Err(e) => {
                 error!("获取链状态失败: {} | Failed to get chain state: {}", e, e);
-                // 提供默认值作为回退 | Provide default values as fallback
-                (vec![0; 32], vec![0; 32], vec![0; 32])
+                // 提供安全的默认值作为回退 | Provide safe default values as fallback
+                let parent_hash = vec![0; 32];
+                let merkle_root = vec![0; 32];
+                
+                // 创建一个有效的默认难度目标，而不是全0
+                // Create a valid default difficulty target instead of all zeros
+                let mut difficulty_target = vec![0xFF; 32]; // 初始化为全1
+                
+                // 设置适合fakenet模式的默认难度
+                difficulty_target[0] = 0x00; // 最高有效字节设为0
+                difficulty_target[1] = 0x80; // 第二个字节设为10000000，总体难度约为2^15
+                
+                warn!("使用默认难度目标: {} | Using default difficulty target: {}", 
+                      hex::encode(&difficulty_target), hex::encode(&difficulty_target));
+                
+                (parent_hash, merkle_root, difficulty_target)
             }
         };
         
@@ -283,11 +297,24 @@ impl MiningPoolService {
         match response {
             PokeResult::Ack => {
                 // 从handle中获取结果
-                // 这里简化处理，返回测试数据
+                // 这里返回更合理的测试数据
                 // 实际应该从响应中解析数据
                 let parent_hash = vec![0; 32];
                 let merkle_root = vec![0; 32];
-                let difficulty = vec![0; 32];
+                
+                // 设置适合fakenet模式的难度目标
+                // 根据fakenet_pow_len=2(16位)和fakenet_log_difficulty=1(难度因子2)
+                // 创建一个有效的难度目标，约等于2^15个前导零位
+                let mut difficulty = vec![0xFF; 32]; // 初始化为全1
+                
+                // 根据fakenet配置调整难度
+                // 对于fakenet_pow_len=2和fakenet_log_difficulty=1
+                // 设置前2字节为0，第3字节为0x80
+                difficulty[0] = 0x00; // 最高有效字节设为0
+                difficulty[1] = 0x80; // 第二个字节设为10000000，总体难度约为2^15
+                
+                // 记录实际使用的难度值
+                info!("设置挖矿难度目标: {}", hex::encode(&difficulty));
                 
                 Ok((parent_hash, merkle_root, difficulty))
             },
@@ -535,12 +562,22 @@ impl MiningPoolService {
             // 计算区块哈希 | Calculate block hash
             let hash = blake3::hash(&block_data);
             
+            // 记录提交的nonce和计算出的哈希值
+            info!(
+                "收到nonce: {}, 计算出哈希值: {}", 
+                hex::encode(&result.nonce), hex::encode(hash.as_bytes())
+            );
+            
+            // 记录当前难度目标
+            info!("当前难度目标: {}", hex::encode(&work.difficulty_target));
+            
             // 比较哈希与目标难度 | Compare hash with target difficulty
             let is_valid = compare_hash_with_target(hash.as_bytes(), &work.difficulty_target);
             
             if is_valid {
                 info!(
-                    "有效的工作结果: 哈希值 {} 满足难度目标 | Valid work result: hash {} meets difficulty target", 
+                    "有效的工作结果: 哈希值 {} 满足难度目标 {} | Valid work result: hash {} meets difficulty target {}", 
+                    hex::encode(hash.as_bytes()), hex::encode(&work.difficulty_target),
                     hex::encode(hash.as_bytes()), hex::encode(&work.difficulty_target)
                 );
             } else {

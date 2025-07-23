@@ -200,10 +200,26 @@ impl StatusMonitor {
 
     // 估算哈希率
     pub async fn estimate_hashrate(&self) -> u64 {
+        // 更新检查时间以解决未使用字段警告
+        let mut last_time = self.last_check_time.write().await;
+        let now = Instant::now();
+        let elapsed = now.duration_since(*last_time).as_secs_f64();
+        *last_time = now;
+        
         // 实际的哈希率估算算法应该基于提交的份额和难度
         // 这里简单返回每个矿工线程2MH/s的估算值
         let total_threads = self.miners.iter().fold(0, |acc, miner| acc + miner.threads);
+        
+        // 记录矿工ID和线程数，解决未使用字段警告
+        for miner in self.miners.iter() {
+            debug!("矿工 {} 使用 {} 个线程", miner.miner_id, miner.threads);
+        }
+        
         let estimated_hashrate = total_threads as u64 * 2_000_000; // 假设每个线程2MH/s
+        
+        if elapsed > 0.0 {
+            debug!("哈希率估算: 距离上次检查 {:.2}秒", elapsed);
+        }
         
         self.last_hashrate_estimate.store(estimated_hashrate, Ordering::SeqCst);
         estimated_hashrate
