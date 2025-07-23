@@ -41,6 +41,17 @@ miner: build-hoon-all
 	@echo "构建矿工（矿池模式）... | Building miner (pool mode)..."
 	@cargo build --release -p nockchain --features pool_client
 
+# 构建矿池服务器和矿工客户端 | Build pool server and miner client
+.PHONY: pool-full
+pool-full: pool-server miner
+	@echo "矿池服务器和矿工客户端构建完成 | Pool server and miner client built successfully"
+	@echo "矿池服务器: $(OUT_DIR)/pool-server | Pool server: $(OUT_DIR)/pool-server"
+	@echo "矿工客户端: $(OUT_DIR)/miner | Miner client: $(OUT_DIR)/miner"
+	@echo "使用方法: | Usage:"
+	@echo "  启动服务器: | Start server: ./scripts/start-pool-server.sh"
+	@echo "  启动矿工: | Start miner: ./scripts/start-miner.sh <服务器IP:端口> --threads <线程数>"
+	@echo "示例: | Example: ./scripts/start-miner.sh 127.0.0.1:7777 --threads 4 --rebuild"
+
 # 构建钱包工具 | Build wallet tool
 .PHONY: wallet
 wallet: build-hoon-all
@@ -90,6 +101,7 @@ help:
 	@echo "  make release    - 构建发布版本 | Build release version"
 	@echo "  make pool-server - 只构建矿池服务器 | Build only pool server"
 	@echo "  make miner      - 只构建矿工客户端 | Build only miner client"
+	@echo "  make pool-full  - 同时构建矿池服务器和矿工客户端 | Build both pool server and miner client"
 	@echo "  make wallet     - 只构建钱包工具 | Build only wallet tool"
 	@echo "  make dist       - 准备分发包 | Prepare distribution package"
 	@echo "  make clean      - 清理编译产物 | Clean build artifacts"
@@ -154,6 +166,17 @@ install-hoonc:
 install-nockchain: assets/dumb.jam assets/miner.jam
 	@echo "安装nockchain（矿工客户端）... | Installing nockchain (miner client)..."
 	@cargo install --locked --force --path crates/nockchain --bin miner --features pool_client
+
+# 安装矿池服务器 | Install pool server
+.PHONY: install-pool-server
+install-pool-server:
+	@echo "安装矿池服务器... | Installing pool server..."
+	@cargo install --locked --force --path crates/nockchain-pool-server --bin pool-server
+
+# 安装矿池完整套件 | Install complete mining pool suite
+.PHONY: install-pool-full
+install-pool-full: install-pool-server install-nockchain
+	@echo "矿池完整套件已安装 | Complete mining pool suite installed"
 
 # 安装钱包工具 | Install wallet tool
 .PHONY: install-nockchain-wallet

@@ -12,6 +12,9 @@ use tonic::{transport::Server, Request, Response, Status};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 use blake3;
+// 引入状态监控模块
+use crate::status_monitor::StatusMonitor;
+
 // 引入nockchain核心库，用于集成nockchain节点
 use kernels::dumb::KERNEL;
 use nockapp::kernel::boot;
@@ -32,6 +35,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt, registry};
 use std::sync::atomic::{AtomicBool, Ordering};
+
+// 添加新模块声明
+mod status_monitor;
+mod http_api;
 
 // 定义一个静态变量来跟踪是否已经初始化
 static TRACING_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -164,16 +171,24 @@ struct MiningPoolService {
     nockchain: Arc<RwLock<NockApp>>,
     // 线程安全的handle
     handle: ThreadSafeNockAppHandle,
+    // 状态监控器
+    status_monitor: Arc<StatusMonitor>,
 }
 
 impl MiningPoolService {
     fn new(nockchain: NockApp) -> Self {
         let handle = ThreadSafeNockAppHandle::new(nockchain.get_handle());
+        let status_monitor = Arc::new(StatusMonitor::new());
+        
+        // 启动定期状态更新
+        status_monitor::StatusMonitor::start_periodic_updates(status_monitor.clone());
+        
         Self {
             miners: Arc::new(DashMap::new()),
             current_work: Arc::new(RwLock::new(None)),
             nockchain: Arc::new(RwLock::new(nockchain)),
             handle,
+            status_monitor,
         }
     }
 
@@ -192,6 +207,12 @@ impl MiningPoolService {
             let mut current_work = self.current_work.write().await;
             *current_work = Some(context);
         }
+
+        // 更新状态监控器中的工作ID
+        self.status_monitor.update_work_id(work.work_id.clone()).await;
+        
+        // 更新状态监控器中的难度
+        self.status_monitor.update_difficulty(hex::encode(&work.difficulty_target)).await;
 
         // 广播给所有矿工 | Broadcast to all miners
         info!("广播新工作任务 {} 给所有矿工 | Broadcasting new work task {} to all miners", work.work_id, work.work_id);
@@ -252,6 +273,11 @@ impl MiningPoolService {
         // 发送请求并等待响应，使用线程安全的方式
         // Send request and wait for response, using thread-safe method
         let response = self.handle.safe_poke(MiningWire::SetPubKey.to_wire(), request_slab).await?;
+        
+        // 假设获取了区块高度，更新状态监控器
+        // 实际实现中应从nockchain节点获取真实高度
+        let block_height = 12345; // 示例值，实际应从响应中获取
+        self.status_monitor.update_block_height(block_height).await;
         
         // 直接处理响应，不需要调用root()方法
         match response {
@@ -323,7 +349,11 @@ impl MiningPoolService {
         // 验证响应
         // Validate response
         match response {
-            PokeResult::Ack => Ok(true),
+            PokeResult::Ack => {
+                // 更新状态监控 - 区块已接受
+                self.status_monitor.increment_blocks_accepted();
+                Ok(true)
+            },
             PokeResult::Nack => Ok(false),
         }
     }
@@ -356,6 +386,9 @@ impl MiningPool for MiningPoolService {
             miner_id, threads, self.miners.len() + 1, miner_id, threads, self.miners.len() + 1
         );
         
+        // 更新状态监控器中的矿工信息
+        self.status_monitor.update_miner(miner_id.clone(), threads as usize).await;
+        
         // 额外克隆一份miner_id用于后续使用
         let miner_id_for_response = miner_id.clone();
         
@@ -372,16 +405,24 @@ impl MiningPool for MiningPoolService {
         // 开启一个任务处理来自矿工的状态更新 | Start a task to handle status updates from the miner
         let miners = self.miners.clone();
         let miner_id_clone = miner_id.clone(); // 克隆一份用于移动到任务中
+        let status_monitor = self.status_monitor.clone();
         tokio::spawn(async move {
             while let Ok(Some(status)) = stream.message().await {
                 // 更新矿工状态 | Update miner status
                 if let Some(mut miner) = miners.get_mut(&status.miner_id) {
                     miner.threads = status.threads;
+                    
+                    // 更新状态监控器中的矿工线程数
+                    status_monitor.update_miner(status.miner_id.clone(), status.threads as usize).await;
                 }
             }
             
             // 矿工断开连接 | Miner disconnected
             miners.remove(&miner_id_clone);
+            
+            // 从状态监控器中移除矿工
+            status_monitor.remove_miner(&miner_id_clone);
+            
             info!("矿工 {} 断开连接。总矿工数: {} | Miner {} disconnected. Total miners: {}", 
                   &miner_id_clone, miners.len(), &miner_id_clone, miners.len());
         });
@@ -424,7 +465,13 @@ impl MiningPool for MiningPoolService {
         // 验证工作结果 | Validate work result
         let is_valid = self.validate_work(&work_result).await;
         
+        // 更新状态监控器中的矿工份额
+        self.status_monitor.increment_miner_share(&miner_id, is_valid);
+        
         if is_valid {
+            // 增加找到区块的计数
+            self.status_monitor.increment_blocks_found();
+            
             info!(
                 "接受来自矿工 {} 的有效工作，广播区块... | Accepted valid work from miner {}, broadcasting block...", 
                 miner_id, miner_id
@@ -536,7 +583,7 @@ async fn main() -> Result<()> {
     
     // 设置环境变量以禁止跟踪系统初始化，并只显示错误级别的日志
     // Set environment variables to disable tracing initialization and only show error level logs
-    std::env::set_var("RUST_LOG", "error");  // 只显示错误级别日志
+    std::env::set_var("RUST_LOG", "info");  // 修改为info级别以显示更多信息
     std::env::set_var("TRACING_DISABLED", "1");
     
     // 安全地尝试初始化跟踪系统 | Safely try to initialize tracing
@@ -549,6 +596,10 @@ async fn main() -> Result<()> {
     // 读取矿池服务器监听地址 | Read pool server listening address
     let pool_server_address = env::var("POOL_SERVER_ADDRESS")
         .unwrap_or_else(|_| "0.0.0.0:7777".to_string());
+    
+    // 读取HTTP API服务器地址
+    let http_api_address = env::var("HTTP_API_ADDRESS")
+        .unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     
     info!("启动矿池服务器，挖矿公钥: {} | Starting pool server, mining pubkey: {}", mining_pubkey, mining_pubkey);
     
@@ -608,13 +659,19 @@ async fn main() -> Result<()> {
     // 并使用服务的方式来与nockapp交互
     info!("准备初始化矿池服务... | Preparing to initialize mining pool service...");
 
-    // 设置挖矿公钥和启用挖矿 - 以线程安全的方式
-    info!("配置挖矿公钥和启用挖矿... | Configuring mining pubkey and enabling mining...");
+    // 初始化矿池服务
     let service = MiningPoolService::new(nockapp);
+    
+    // 获取对状态监控器的引用，用于HTTP API
+    let status_monitor = service.status_monitor.clone();
     
     // 生成初始工作任务 | Generate initial work task
     let initial_work = service.generate_work().await;
     service.broadcast_work(initial_work).await;
+    
+    // 启动HTTP API服务
+    info!("启动HTTP API服务器在 {} | Starting HTTP API server on {}", http_api_address, http_api_address);
+    http_api::start_api_server(status_monitor, &http_api_address).await;
     
     // 启动gRPC服务器 | Start gRPC server
     let addr = pool_server_address.parse()?;

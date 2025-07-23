@@ -10,6 +10,7 @@ THREADS=$(( $(sysctl -n hw.logicalcpu) - 1 ))
 RUST_LOG=${RUST_LOG:-"info"}
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+REBUILD=false
 
 # 如果系统只有一个CPU核心，使用它
 # If system has only one CPU core, use it
@@ -30,6 +31,7 @@ show_help() {
     echo "选项 | Options:"
     echo "  -t, --threads N    使用的线程数 | Number of threads to use (default: $THREADS)"
     echo "  -l, --log LEVEL    设置日志级别 | Set log level (trace, debug, info, warn, error)"
+    echo "  -r, --rebuild      重新编译矿工程序 | Rebuild miner program"
     echo "  -h, --help         显示此帮助信息 | Show this help information"
     echo ""
     echo "示例 | Example:"
@@ -64,6 +66,10 @@ while [[ $# -gt 0 ]]; do
             shift
             shift
             ;;
+        -r|--rebuild)
+            REBUILD=true
+            shift
+            ;;
         -h|--help)
             show_help
             ;;
@@ -89,6 +95,17 @@ if ! [[ "$THREADS" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
+# 如果指定了重新编译或可执行文件不存在，则编译
+# If rebuild is specified or executable doesn't exist, compile
+if [ "$REBUILD" = true ] || [ ! -f "$ROOT_DIR/target/release/miner" ]; then
+    echo "编译矿工客户端，启用矿池模式... | Compiling miner client with pool mode enabled..."
+    cd "$ROOT_DIR" && cargo build --release --bin miner --features pool_client
+    if [ $? -ne 0 ]; then
+        echo "错误: 编译失败 | Error: Compilation failed"
+        exit 1
+    fi
+fi
+
 # 设置环境变量
 # Set environment variables
 export RUST_LOG
@@ -103,7 +120,7 @@ echo "日志级别 | Log level: $RUST_LOG"
 if [ -f "$ROOT_DIR/target/release/miner" ]; then
     "$ROOT_DIR/target/release/miner" "$POOL_SERVER" --threads "$THREADS"
 else
-    echo "错误: 找不到miner可执行文件。请先运行'make release'来构建它"
-    echo "Error: Cannot find miner executable. Please run 'make release' to build it first"
+    echo "错误: 找不到miner可执行文件。请使用--rebuild选项重新编译"
+    echo "Error: Cannot find miner executable. Please use --rebuild option to compile"
     exit 1
 fi
