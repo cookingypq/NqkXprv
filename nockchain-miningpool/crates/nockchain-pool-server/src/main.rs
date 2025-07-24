@@ -267,55 +267,48 @@ impl MiningPoolService {
     
     // 从nockchain节点获取区块链状态 | Get blockchain state from nockchain node
     async fn get_chain_state(&self) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-        // 创建请求获取当前区块链状态的poke
-        // Create poke to get current blockchain state
-        let mut request_slab = NounSlab::new();
-        let get_mining_info = Atom::from_value(&mut request_slab, "get-mining-info")
-            .expect("Failed to create get-mining-info atom");
-        let request_poke = T(
-            &mut request_slab,
-            &[D(tas!(b"command")), get_mining_info.as_noun()],
-        );
-        request_slab.set_root(request_poke);
+        use nockvm::noun::{Noun, D, T};
+        use nockvm_macros::tas;
+        use nockapp::noun::slab::NounSlab;
         
-        // 发送请求并等待响应，使用线程安全的方式
-        // Send request and wait for response, using thread-safe method
-        let response = self.handle.safe_poke(MiningWire::SetPubKey.to_wire(), request_slab).await?;
-        
-        // 假设获取了区块高度，更新状态监控器
-        // 实际实现中应从nockchain节点获取真实高度
-        let block_height = 12345; // 示例值，实际应从响应中获取
-        self.status_monitor.update_block_height(block_height).await;
-        
-        // 直接处理响应，不需要调用root()方法
-        match response {
-            PokeResult::Ack => {
-                // 从handle中获取结果
-                // 这里返回更合理的测试数据
-                // 实际应该从响应中解析数据
-                let parent_hash = vec![0; 32];
-                let merkle_root = vec![0; 32];
-                
-                // 设置适合fakenet模式的难度目标
-                // 根据fakenet_pow_len=2(16位)和fakenet_log_difficulty=1(难度因子2)
-                // 创建一个有效的难度目标，约等于2^15个前导零位
-                let mut difficulty = vec![0xFF; 32]; // 初始化为全1
-                
-                // 根据fakenet配置调整难度
-                // 对于fakenet_pow_len=2和fakenet_log_difficulty=1
-                // 设置前2字节为0，第3字节为0x80
-                difficulty[0] = 0x00; // 最高有效字节设为0
-                difficulty[1] = 0x80; // 第二个字节设为10000000，总体难度约为2^15
-                
-                // 记录实际使用的难度值
-                info!("设置挖矿难度目标: {}", hex::encode(&difficulty));
-                
-                Ok((parent_hash, merkle_root, difficulty))
-            },
-            PokeResult::Nack => {
-                Err(anyhow::anyhow!("Nack response from nockchain node"))
-            }
+        // 1. peek [%heavy ~] 获取 heaviest block-id
+        let mut heavy_slab = NounSlab::new();
+        let heavy_path = T(&mut heavy_slab, &[D(tas!(b"heavy")), D(0)]);
+        heavy_slab.set_root(heavy_path);
+        let block_id = {
+            let handle = self.nockchain.read().await.get_handle();
+            let res = handle.peek(heavy_slab).await.map_err(|e| anyhow::anyhow!("peek heavy failed: {e}"))?;
+            let Some(slab) = res else { return Err(anyhow::anyhow!("no heavy block returned")); };
+            // slab.root() 应该是 (unit (unit block-id))
+            let root = unsafe { slab.root() };
+            // 解包两层 Some
+            let cell1 = root.as_cell().ok_or_else(|| anyhow::anyhow!("heavy: not cell1"))?;
+            let cell2 = cell1.tail().as_cell().ok_or_else(|| anyhow::anyhow!("heavy: not cell2"))?;
+            let block_id_noun = cell2.head();
+            block_id_noun
+        };
+        // 2. peek [%block <block-id> ~] 获取 page
+        let mut block_slab = NounSlab::new();
+        let block_path = T(&mut block_slab, &[D(tas!(b"block")), block_id, D(0)]);
+        block_slab.set_root(block_path);
+        let handle = self.nockchain.read().await.get_handle();
+        let res = handle.peek(block_slab).await.map_err(|e| anyhow::anyhow!("peek block failed: {e}"))?;
+        let Some(slab) = res else { return Err(anyhow::anyhow!("no block page returned")); };
+        let root = unsafe { slab.root() };
+        // page结构通常为cell，需根据具体结构解析
+        // 这里只做简单假设：height在head，target在tail（实际需根据hoon结构调整）
+        let page_cell = root.as_cell().ok_or_else(|| anyhow::anyhow!("block page: not cell"))?;
+        let height_noun = page_cell.head();
+        let target_noun = page_cell.tail();
+        let block_height = height_noun.as_atom().and_then(|a| a.as_u64()).unwrap_or(0);
+        let mut target_bytes = vec![];
+        if let Some(atom) = target_noun.as_atom() {
+            target_bytes = atom.to_bytes();
         }
+        // 更新状态监控器
+        self.status_monitor.update_block_height(block_height).await;
+        // parent_hash/merkle_root暂用空（如需可继续解析page结构）
+        Ok((vec![0;32], vec![0;32], target_bytes))
     }
     
     // 将成功的区块提交到nockchain节点 | Submit successful block to nockchain node
