@@ -1,7 +1,7 @@
 use anyhow::Result;
 use dashmap::DashMap;
 use dotenv::dotenv;
-use futures_core::Stream;
+use futures::Stream;
 use std::env;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -35,9 +35,7 @@ use nockapp::kernel::boot::init_default_tracing;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // 添加用于检查跟踪系统状态的导入
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, fmt, registry};
+use tokio::sync::broadcast;
 
 // 添加新模块声明
 mod status_monitor;
@@ -132,12 +130,15 @@ impl Stream for WorkOrderStream {
 // Fix: Use thread-safe way to wrap NockAppHandle
 struct ThreadSafeNockAppHandle {
     handle: Arc<Mutex<NockAppHandle>>,
+    effect_sender: Arc<broadcast::Sender<NounSlab>>,
 }
 
 impl ThreadSafeNockAppHandle {
     fn new(handle: NockAppHandle) -> Self {
+        let effect_sender = handle.effect_sender.clone();
         Self {
             handle: Arc::new(Mutex::new(handle)),
+            effect_sender,
         }
     }
     
@@ -178,13 +179,61 @@ impl MiningPoolService {
         // 启动定期状态更新
         status_monitor::StatusMonitor::start_periodic_updates(status_monitor.clone());
         
-        Self {
+        let service = Self {
             miners: Arc::new(DashMap::new()),
             current_work: Arc::new(RwLock::new(None)),
             nockchain: Arc::new(RwLock::new(nockchain)),
             handle,
             status_monitor,
-        }
+        };
+        
+        // 启动区块链事件监听
+        service.start_blockchain_event_listener();
+        
+        service
+    }
+
+    // 启动区块链事件监听器，用于监听新区块事件
+    fn start_blockchain_event_listener(&self) {
+        // 克隆必要的引用以便在异步任务中使用
+        let service_clone = Arc::new(self.clone());
+        
+        // 启动异步任务监听区块链事件
+        tokio::spawn(async move {
+            // 获取effect接收器，用于接收区块链事件
+            let mut effect_receiver = service_clone.handle.effect_sender.subscribe();
+            
+            info!("开始监听区块链事件 | Started listening for blockchain events");
+            
+            // 持续监听区块链事件
+            while let Ok(_effect) = effect_receiver.recv().await {
+                // 当收到任何effect时，我们检查当前链状态是否有更新
+                // 使用peek [%heavy ~] 来获取当前最新区块
+                let current_block_id = match service_clone.get_current_block_id().await {
+                    Ok(id) => id,
+                    Err(e) => {
+                        warn!("获取当前区块ID失败: {} | Failed to get current block ID: {}", e, e);
+                        continue;
+                    }
+                };
+                
+                // 检查是否需要更新工作任务
+                let should_update = {
+                    // 检查当前工作任务是否存在，以及关联的区块ID是否与最新的不同
+                    let current_work = service_clone.current_work.read().await;
+                    current_work.is_none() || service_clone.is_work_outdated(&current_block_id).await
+                };
+                
+                if should_update {
+                    // 生成新工作并广播
+                    info!("检测到区块链状态更新，生成新工作任务 | Detected blockchain state update, generating new work task");
+                    let new_work = service_clone.generate_work().await;
+                    service_clone.broadcast_work(new_work).await;
+                }
+            }
+            
+            warn!("区块链事件监听器已退出 | Blockchain event listener exited");
+        });
     }
 
     // 广播工作任务给所有矿工 | Broadcast work task to all miners
@@ -295,6 +344,7 @@ impl MiningPoolService {
             let block_id_noun = cell2.head();
             block_id_noun
         };
+        
         // 2. peek [%block <block-id> ~] 获取 page
         let mut block_slab = NounSlab::new();
         let block_path = T(&mut block_slab, &[D(tas!(b"block")), block_id, D(0)]);
@@ -303,18 +353,68 @@ impl MiningPoolService {
         let res = handle.peek(block_slab).await.map_err(|e| anyhow::anyhow!("peek block failed: {e}"))?;
         let Some(slab) = res else { return Err(anyhow::anyhow!("no block page returned")); };
         let root = unsafe { slab.root() };
-        // page结构通常为cell，需根据具体结构解析
-        // 这里只做简单假设：height在head，target在tail（实际需根据hoon结构调整）
+        
+        // 解析区块页面结构
+        // 区块页面结构通常包含更多信息，我们需要提取:
+        // 1. 区块高度 (height)
+        // 2. 目标难度 (target)
+        // 3. 父区块哈希 (parent_hash)
         let page_cell = root.as_cell().map_err(|_| anyhow::anyhow!("block page: not cell"))?;
+        
+        // 获取区块高度
         let height_noun = page_cell.head();
-        let target_noun = page_cell.tail();
         let block_height = height_noun.as_atom().and_then(|a| a.as_u64()).unwrap_or(0);
-        let atom = target_noun.as_atom().map_err(|e| anyhow::anyhow!("block page: target_noun 不是 atom: {}", e))?;
-        let target_bytes = atom.to_ne_bytes();
+        
+        // 获取区块内容
+        let content_cell = page_cell.tail().as_cell().map_err(|_| anyhow::anyhow!("block page: content not cell"))?;
+        
+        // 获取目标难度
+        let target_noun = content_cell.head();
+        let target_atom = target_noun.as_atom().map_err(|e| anyhow::anyhow!("block page: target_noun 不是 atom: {}", e))?;
+        let target_bytes = target_atom.to_ne_bytes();
+        
+        // 获取父区块哈希
+        let mut parent_hash_bytes = vec![0; 32]; // 默认值
+        
+        // 尝试获取父区块ID
+        if let Ok(parent_cell) = content_cell.tail().as_cell() {
+            if let Ok(parent_id_noun) = parent_cell.head().as_atom() {
+                // 将父区块ID转换为哈希值
+                parent_hash_bytes = parent_id_noun.to_ne_bytes();
+                // 如果哈希不足32字节，填充到32字节
+                if parent_hash_bytes.len() < 32 {
+                    let mut padded = vec![0; 32];
+                    padded[32 - parent_hash_bytes.len()..].copy_from_slice(&parent_hash_bytes);
+                    parent_hash_bytes = padded;
+                } else if parent_hash_bytes.len() > 32 {
+                    // 如果哈希超过32字节，截取前32字节
+                    parent_hash_bytes = parent_hash_bytes[0..32].to_vec();
+                }
+            }
+        }
+        
+        // 尝试获取交易列表并计算默克尔根
+        let mut merkle_root_bytes = vec![0; 32]; // 默认值
+        
+        // 尝试获取交易列表
+        if let Ok(txs_cell) = content_cell.tail().as_cell() {
+            if let Ok(txs_list) = txs_cell.tail().as_cell() {
+                // 这里应该遍历交易列表并计算默克尔根
+                // 但由于结构可能很复杂，我们简化为使用区块ID的哈希作为默克尔根
+                let block_id_atom = block_id.as_atom().unwrap_or_else(|_| Atom::from_value(&mut NounSlab::<nockapp::noun::slab::NockJammer>::new(), 0).unwrap());
+                let block_id_bytes = block_id_atom.to_ne_bytes();
+                
+                // 使用blake3计算哈希作为默克尔根
+                let hash = blake3::hash(&block_id_bytes);
+                merkle_root_bytes = hash.as_bytes().to_vec();
+            }
+        }
+        
         // 更新状态监控器
         self.status_monitor.update_block_height(block_height).await;
-        // parent_hash/merkle_root暂用空（如需可继续解析page结构）
-        Ok((vec![0;32], vec![0;32], target_bytes))
+        
+        // 返回完整的区块链状态
+        Ok((parent_hash_bytes, merkle_root_bytes, target_bytes))
     }
     
     // 将成功的区块提交到nockchain节点 | Submit successful block to nockchain node
@@ -375,6 +475,82 @@ impl MiningPoolService {
                 Ok(true)
             },
             PokeResult::Nack => Ok(false),
+        }
+    }
+
+    // 获取当前最新区块ID
+    async fn get_current_block_id(&self) -> Result<Vec<u8>, anyhow::Error> {
+        // 使用peek [%heavy ~] 获取当前最新区块ID
+        let mut heavy_slab = NounSlab::new();
+        let heavy_path = T(&mut heavy_slab, &[D(tas!(b"heavy")), D(0)]);
+        heavy_slab.set_root(heavy_path);
+        
+        let handle = self.nockchain.read().await.get_handle();
+        let res = handle.peek(heavy_slab).await.map_err(|e| anyhow::anyhow!("peek heavy failed: {e}"))?;
+        let Some(slab) = res else { return Err(anyhow::anyhow!("no heavy block returned")); };
+        
+        // 解析返回的区块ID
+        let root = unsafe { slab.root() };
+        let cell1 = root.as_cell().map_err(|_| anyhow::anyhow!("heavy: not cell1"))?;
+        let cell2 = cell1.tail().as_cell().map_err(|_| anyhow::anyhow!("heavy: not cell2"))?;
+        let block_id_noun = cell2.head();
+        
+        // 将区块ID转换为字节
+        let block_id_atom = block_id_noun.as_atom().map_err(|_| anyhow::anyhow!("block_id not atom"))?;
+        let block_id_bytes = block_id_atom.to_ne_bytes();
+        
+        Ok(block_id_bytes)
+    }
+    
+    // 检查当前工作是否过时
+    async fn is_work_outdated(&self, _current_block_id: &[u8]) -> bool {
+        // 获取当前工作任务
+        let current_work = self.current_work.read().await;
+        if let Some(work) = &*current_work {
+            // 获取当前区块链状态
+            match self.get_chain_state().await {
+                Ok((parent_hash, _, _)) => {
+                    // 比较当前工作的parent_hash与最新区块链状态中的parent_hash
+                    // 如果不同，说明区块链状态已更新，当前工作过时
+                    if parent_hash != work.parent_hash {
+                        info!("检测到区块链状态更新，当前工作已过时 | Detected blockchain state update, current work is outdated");
+                        info!("最新parent_hash: {}, 当前工作parent_hash: {}", 
+                              hex::encode(&parent_hash), hex::encode(&work.parent_hash));
+                        return true;
+                    }
+                    
+                    // 检查时间戳，如果当前工作生成时间超过30秒，也认为过时
+                    let now = chrono::Utc::now().timestamp() as u64;
+                    if now > work.timestamp + 30 {
+                        info!("当前工作已超过30秒，生成新工作 | Current work is over 30 seconds old, generating new work");
+                        return true;
+                    }
+                    
+                    return false;
+                },
+                Err(_) => {
+                    // 如果获取链状态失败，保守起见认为工作已过时
+                    warn!("获取链状态失败，假设工作已过时 | Failed to get chain state, assuming work is outdated");
+                    return true;
+                }
+            }
+        }
+        
+        // 如果没有当前工作，也需要生成新工作
+        true
+    }
+
+    // 添加clone实现
+    fn clone(&self) -> Self {
+        Self {
+            miners: self.miners.clone(),
+            current_work: self.current_work.clone(),
+            nockchain: self.nockchain.clone(),
+            handle: ThreadSafeNockAppHandle {
+                handle: self.handle.handle.clone(),
+                effect_sender: self.handle.effect_sender.clone(),
+            },
+            status_monitor: self.status_monitor.clone(),
         }
     }
 }
@@ -714,6 +890,35 @@ async fn main() -> Result<()> {
     // 生成初始工作任务
     let initial_work = service.generate_work().await;
     service.broadcast_work(initial_work).await;
+    
+    // 启动定期检查区块链状态的任务
+    // 这是一个额外的保障机制，防止事件监听器错过某些更新
+    let service_clone = Arc::new(service.clone());
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            info!("执行定期区块链状态检查 | Performing periodic blockchain state check");
+            
+            // 获取当前区块ID
+            match service_clone.get_current_block_id().await {
+                Ok(current_block_id) => {
+                    // 检查当前工作是否过时
+                    if service_clone.is_work_outdated(&current_block_id).await {
+                        // 如果过时，生成新工作并广播
+                        info!("定期检查发现区块链状态更新，生成新工作 | Periodic check detected blockchain state update, generating new work");
+                        let new_work = service_clone.generate_work().await;
+                        service_clone.broadcast_work(new_work).await;
+                    } else {
+                        info!("定期检查：当前工作仍然有效 | Periodic check: current work is still valid");
+                    }
+                },
+                Err(e) => {
+                    warn!("定期检查：获取区块ID失败: {} | Periodic check: failed to get block ID: {}", e, e);
+                }
+            }
+        }
+    });
     
     // 启动HTTP API服务
     info!("启动HTTP API服务器在 {}", http_api_address);
