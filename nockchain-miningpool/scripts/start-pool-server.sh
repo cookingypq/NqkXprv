@@ -85,6 +85,7 @@ fi
 export MINING_PUBKEY
 export RUST_LOG
 export POOL_SERVER_ADDRESS
+export MINIMAL_LOG_FORMAT=1  # 添加这行，启用与nockchain兼容的日志格式
 
 echo "启动矿池服务器 | Starting pool server"
 echo "挖矿公钥 | Mining public key: $MINING_PUBKEY"

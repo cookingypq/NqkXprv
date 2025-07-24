@@ -263,7 +263,7 @@ impl StatusMonitor {
             None => "从未".to_string(),
         };
         
-        info!("============ 矿池状态摘要 ============");
+        info!("------ 矿池状态摘要 ------");
         info!("运行时间: {} 秒", stats.uptime_seconds);
         info!("连接矿工: {} (总线程数: {})", stats.connected_miners, stats.total_threads);
         info!("当前难度: {}", stats.current_difficulty);
@@ -273,7 +273,7 @@ impl StatusMonitor {
         info!("找到区块: {} (已接受: {})", stats.blocks_found, stats.blocks_accepted);
         info!("当前工作ID: {}", stats.current_work_id);
         info!("工作更新次数: {}", stats.work_updates_count);
-        info!("======================================");
+        info!("-------------------------");
     }
 
     // 启动定期状态更新

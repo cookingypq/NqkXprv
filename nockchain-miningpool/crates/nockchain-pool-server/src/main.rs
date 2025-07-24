@@ -35,6 +35,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt, registry};
 use std::sync::atomic::{AtomicBool, Ordering};
+// 保留一次日志初始化导入
+use nockapp::kernel::boot::init_default_tracing;
 
 // 添加新模块声明
 mod status_monitor;
@@ -43,25 +45,17 @@ mod http_api;
 // 定义一个静态变量来跟踪是否已经初始化
 static TRACING_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-// 自定义函数来安全地初始化跟踪系统
 fn try_init_tracing() {
-    // 检查是否已初始化或被环境变量禁用
-    if TRACING_INITIALIZED.load(Ordering::SeqCst) || 
-       std::env::var("TRACING_DISABLED").is_ok() {
-        return; // 如果已初始化或被禁用，则直接返回
+    // 检查是否已初始化
+    if TRACING_INITIALIZED.load(Ordering::SeqCst) {
+        return;
     }
     
-    // 尝试在一个单独的线程上初始化，避免与其他潜在的初始化冲突
-    std::thread::spawn(|| {
-        // 尝试初始化跟踪系统
-        let filter = EnvFilter::new(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()));
-        
-        // 使用标准的 fmt 层
-        let fmt_layer = fmt::layer().with_target(true);
-        
-        // 尝试设置全局跟踪系统，但忽略可能的错误
-        let _ = registry().with(filter).with(fmt_layer).try_init();
-    }).join().ok(); // 忽略可能的错误
+    // 使用 nockchain 推荐的默认 cli
+    let cli = nockapp::kernel::boot::default_boot_cli(true);
+    
+    // 使用与nockchain相同的日志初始化方法
+    init_default_tracing(&cli);
     
     // 标记为已初始化
     TRACING_INITIALIZED.store(true, Ordering::SeqCst);
@@ -615,40 +609,56 @@ fn compare_hash_with_target(hash: &[u8], target: &[u8]) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // 加载.env文件 | Load .env file
+    // 加载.env文件
     dotenv().ok();
     
-    // 设置环境变量以禁止跟踪系统初始化，并只显示错误级别的日志
-    // Set environment variables to disable tracing initialization and only show error level logs
-    std::env::set_var("RUST_LOG", "info");  // 修改为info级别以显示更多信息
-    std::env::set_var("TRACING_DISABLED", "1");
+    // 使用与nockchain兼容的日志配置
+    if std::env::var("RUST_LOG").is_err() {
+        // 仅当用户未设置时提供默认值
+        std::env::set_var("RUST_LOG", "info");
+    }
     
-    // 安全地尝试初始化跟踪系统 | Safely try to initialize tracing
+    // 显示MINIMAL_LOG_FORMAT环境变量
+    if std::env::var("MINIMAL_LOG_FORMAT").is_err() {
+        std::env::set_var("MINIMAL_LOG_FORMAT", "1");
+    }
+    
+    // 初始化与nockchain兼容的日志系统
     try_init_tracing();
     
-    // 读取矿工公钥环境变量 | Read mining public key environment variable
-    let mining_pubkey = env::var("MINING_PUBKEY")
-        .expect("必须设置MINING_PUBKEY环境变量 | MINING_PUBKEY environment variable must be set");
+    // 添加矿池服务器欢迎信息，格式与nockchain一致
+    info!("
+    _   _            _        _           _          _____             _ 
+   | \\ | |          | |      | |         (_)        |  __ \\           | |
+   |  \\| | ___   ___| | _____| |__   __ _ _ _ __    | |__) |__   ___ | |
+   | . ` |/ _ \\ / __| |/ / __| '_ \\ / _` | | '_ \\   |  ___/ _ \\ / _ \\| |
+   | |\\  | (_) | (__|   < (__| | | | (_| | | | | |  | |  | (_) | (_) | |
+   |_| \\_|\\___/ \\___|_|\\_\\___|_| |_|\\__,_|_|_| |_|  |_|   \\___/ \\___/|_|
+                                                                        
+    ");
     
-    // 读取矿池服务器监听地址 | Read pool server listening address
+        // 读取矿工公钥环境变量
+    let mining_pubkey = env::var("MINING_PUBKEY")
+        .expect("必须设置MINING_PUBKEY环境变量");
+
+    // 读取矿池服务器监听地址
     let pool_server_address = env::var("POOL_SERVER_ADDRESS")
         .unwrap_or_else(|_| "0.0.0.0:7777".to_string());
     
     // 读取HTTP API服务器地址
     let http_api_address = env::var("HTTP_API_ADDRESS")
         .unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+
+    info!("启动矿池服务器");
+    info!("挖矿公钥: {}", mining_pubkey);
     
-    info!("启动矿池服务器，挖矿公钥: {} | Starting pool server, mining pubkey: {}", mining_pubkey, mining_pubkey);
+    // 初始化nockchain节点
+    info!("初始化内嵌nockchain节点...");
     
-    // 初始化nockchain节点 | Initialize nockchain node
-    info!("初始化内嵌nockchain节点... | Initializing embedded nockchain node...");
+    // 创建配置，使用nockchain原生日志系统
+    let nockapp_cli = boot::default_boot_cli(true);
     
-    // 创建配置但跳过日志初始化
-    // Create config but skip logging initialization
-    let nockapp_cli = boot::default_boot_cli(false);
-    
-    // 创建nockchain配置并禁用日志初始化
-    // Create nockchain config and disable logging initialization
+    // 创建nockchain配置
     let nockchain_cli = nockchain::config::NockchainCli {
         nockapp_cli: nockapp_cli,
         npc_socket: ".socket/nockchain_npc.sock".to_string(),
@@ -694,7 +704,7 @@ async fn main() -> Result<()> {
     
     // 注意：NockApp不能被克隆，因此我们只创建服务
     // 并使用服务的方式来与nockapp交互
-    info!("准备初始化矿池服务... | Preparing to initialize mining pool service...");
+    info!("准备初始化矿池服务...");
 
     // 初始化矿池服务
     let service = MiningPoolService::new(nockapp);
@@ -702,17 +712,17 @@ async fn main() -> Result<()> {
     // 获取对状态监控器的引用，用于HTTP API
     let status_monitor = service.status_monitor.clone();
     
-    // 生成初始工作任务 | Generate initial work task
+    // 生成初始工作任务
     let initial_work = service.generate_work().await;
     service.broadcast_work(initial_work).await;
     
     // 启动HTTP API服务
-    info!("启动HTTP API服务器在 {} | Starting HTTP API server on {}", http_api_address, http_api_address);
+    info!("启动HTTP API服务器在 {}", http_api_address);
     http_api::start_api_server(status_monitor, &http_api_address).await;
     
-    // 启动gRPC服务器 | Start gRPC server
+    // 启动gRPC服务器
     let addr = pool_server_address.parse()?;
-    info!("矿池服务器监听于 {} | Pool server listening on {}", addr, addr);
+    info!("矿池服务器监听于 {}", addr);
     
     Server::builder()
         .add_service(MiningPoolServer::new(service))
