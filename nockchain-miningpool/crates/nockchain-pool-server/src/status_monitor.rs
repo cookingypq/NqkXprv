@@ -253,29 +253,6 @@ impl StatusMonitor {
         }
     }
 
-    // 定期打印状态摘要
-    pub async fn print_status_summary(&self) {
-        let stats = self.get_statistics().await;
-        
-        // 格式化区块时间
-        let block_time_str = match stats.last_block_time {
-            Some(time) => humantime::format_rfc3339(time.into()).to_string(),
-            None => "从未".to_string(),
-        };
-        
-        info!("------ 矿池状态摘要 ------");
-        info!("运行时间: {} 秒", stats.uptime_seconds);
-        info!("连接矿工: {} (总线程数: {})", stats.connected_miners, stats.total_threads);
-        info!("当前难度: {}", stats.current_difficulty);
-        info!("哈希率: {} H/s", stats.estimated_hashrate);
-        info!("区块高度: {}", stats.current_block_height);
-        info!("最后区块时间: {}", block_time_str);
-        info!("找到区块: {} (已接受: {})", stats.blocks_found, stats.blocks_accepted);
-        info!("当前工作ID: {}", stats.current_work_id);
-        info!("工作更新次数: {}", stats.work_updates_count);
-        info!("-------------------------");
-    }
-
     // 启动定期状态更新
     pub fn start_periodic_updates(monitor: Arc<Self>) {
         // 获取环境变量配置的日志间隔，默认为300秒（5分钟）
@@ -312,16 +289,16 @@ impl StatusMonitor {
             });
         }
         
-        // 启动定期状态摘要打印，使用配置的间隔
-        {
-            let monitor_clone = monitor.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(status_log_interval));
-                loop {
-                    interval.tick().await;
-                    monitor_clone.print_status_summary().await;
-                }
-            });
-        }
+        // 移除定期状态摘要打印
+        // {
+        //     let monitor_clone = monitor.clone();
+        //     tokio::spawn(async move {
+        //         let mut interval = tokio::time::interval(Duration::from_secs(status_log_interval));
+        //         loop {
+        //             interval.tick().await;
+        //             monitor_clone.print_status_summary().await;
+        //         }
+        //     });
+        // }
     }
 } 

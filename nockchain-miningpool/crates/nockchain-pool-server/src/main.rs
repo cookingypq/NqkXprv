@@ -30,13 +30,14 @@ use zkvm_jetpack::hot::produce_prover_hot_state;
 use bytes::Bytes;
 use std::sync::Mutex;
 
+// 简化日志初始化导入
+use nockapp::kernel::boot::init_default_tracing;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 // 添加用于检查跟踪系统状态的导入
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt, registry};
-use std::sync::atomic::{AtomicBool, Ordering};
-// 保留一次日志初始化导入
-use nockapp::kernel::boot::init_default_tracing;
 
 // 添加新模块声明
 mod status_monitor;
@@ -267,7 +268,14 @@ impl MiningPoolService {
     
     // 从nockchain节点获取区块链状态 | Get blockchain state from nockchain node
     async fn get_chain_state(&self) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-        use nockvm::noun::{Noun, D, T};
+        // 优先读取 DIFFICULTY_TARGET 环境变量
+        if let Ok(diff_hex) = std::env::var("DIFFICULTY_TARGET") {
+            if let Ok(bytes) = hex::decode(&diff_hex) {
+                // parent_hash/merkle_root 仍用空
+                return Ok((vec![0;32], vec![0;32], bytes));
+            }
+        }
+        use nockvm::noun::{D, T};
         use nockvm_macros::tas;
         use nockapp::noun::slab::NounSlab;
         
@@ -282,8 +290,8 @@ impl MiningPoolService {
             // slab.root() 应该是 (unit (unit block-id))
             let root = unsafe { slab.root() };
             // 解包两层 Some
-            let cell1 = root.as_cell().ok_or_else(|| anyhow::anyhow!("heavy: not cell1"))?;
-            let cell2 = cell1.tail().as_cell().ok_or_else(|| anyhow::anyhow!("heavy: not cell2"))?;
+            let cell1 = root.as_cell().map_err(|_| anyhow::anyhow!("heavy: not cell1"))?;
+            let cell2 = cell1.tail().as_cell().map_err(|_| anyhow::anyhow!("heavy: not cell2"))?;
             let block_id_noun = cell2.head();
             block_id_noun
         };
@@ -297,14 +305,12 @@ impl MiningPoolService {
         let root = unsafe { slab.root() };
         // page结构通常为cell，需根据具体结构解析
         // 这里只做简单假设：height在head，target在tail（实际需根据hoon结构调整）
-        let page_cell = root.as_cell().ok_or_else(|| anyhow::anyhow!("block page: not cell"))?;
+        let page_cell = root.as_cell().map_err(|_| anyhow::anyhow!("block page: not cell"))?;
         let height_noun = page_cell.head();
         let target_noun = page_cell.tail();
         let block_height = height_noun.as_atom().and_then(|a| a.as_u64()).unwrap_or(0);
-        let mut target_bytes = vec![];
-        if let Some(atom) = target_noun.as_atom() {
-            target_bytes = atom.to_bytes();
-        }
+        let atom = target_noun.as_atom().map_err(|e| anyhow::anyhow!("block page: target_noun 不是 atom: {}", e))?;
+        let target_bytes = atom.to_ne_bytes();
         // 更新状态监控器
         self.status_monitor.update_block_height(block_height).await;
         // parent_hash/merkle_root暂用空（如需可继续解析page结构）
