@@ -672,8 +672,8 @@ async fn main() -> Result<()> {
         max_system_memory_fraction: None,
         max_system_memory_bytes: None,
         num_threads: Some(1),
-        fakenet_pow_len: Some(2),
-        fakenet_log_difficulty: Some(1),
+        fakenet_pow_len: Some(3),
+        fakenet_log_difficulty: Some(21),
         fakenet_genesis_jam_path: None,
     };
     
