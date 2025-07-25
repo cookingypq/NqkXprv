@@ -17,7 +17,7 @@ use regex::Regex;
 // 引入状态监控模块
 use crate::status_monitor::StatusMonitor;
 // 引入错误处理模块
-use crate::error::{PoolServerError, PoolResult, ErrorSeverity};
+use crate::error::PoolServerError;
 // 引入网络管理器模块
 use crate::network_manager::{NetworkManager, RetryConfig};
 
@@ -84,6 +84,10 @@ struct MinerConnection {
     miner_id: String,
     work_sender: mpsc::Sender<Result<WorkOrder, Status>>,
     threads: u32,
+    session_id: String,           // 会话标识符，用于重连识别
+    last_work_id: Option<String>, // 最后一次分配的工作ID，用于重连时恢复
+    connected_at: chrono::DateTime<chrono::Utc>, // 连接时间
+    last_active: chrono::DateTime<chrono::Utc>,  // 最后活动时间
 }
 
 // 工作订单上下文 | Work order context
@@ -201,8 +205,10 @@ impl MiningPoolService {
         
         // 设置状态监控器
         network_manager.set_status_monitor(status_monitor.clone());
+        
         let network_manager = Arc::new(network_manager);
         
+        // 创建服务实例
         let service = Self {
             miners: Arc::new(DashMap::new()),
             current_work: Arc::new(RwLock::new(None)),
@@ -212,10 +218,46 @@ impl MiningPoolService {
             network_manager,
         };
         
-        // 启动区块链事件监听器
-        service.start_blockchain_event_listener();
+        // 启动矿工连接监控任务
+        service.start_miner_connection_monitor();
         
         service
+    }
+    
+    // 启动矿工连接监控任务
+    fn start_miner_connection_monitor(&self) {
+        let miners = self.miners.clone();
+        let status_monitor = self.status_monitor.clone();
+        
+        // 每30秒检查一次矿工连接状态
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            
+            loop {
+                interval.tick().await;
+                
+                let now = chrono::Utc::now();
+                let mut disconnected_miners = Vec::new();
+                
+                // 检查每个矿工的最后活动时间
+                for miner in miners.iter() {
+                    let inactive_duration = now.signed_duration_since(miner.last_active);
+                    
+                    // 如果超过2分钟没有活动，认为矿工已断开
+                    if inactive_duration.num_seconds() > 120 {
+                        disconnected_miners.push(miner.miner_id.clone());
+                        info!("矿工 {} 超过2分钟无活动，标记为断开连接", miner.miner_id);
+                    }
+                }
+                
+                // 移除断开连接的矿工
+                for miner_id in disconnected_miners {
+                    miners.remove(&miner_id);
+                    status_monitor.remove_miner(&miner_id);
+                    info!("已移除断开连接的矿工 {}。总矿工数: {}", miner_id, miners.len());
+                }
+            }
+        });
     }
     
     // 启动区块链事件监听器
@@ -371,8 +413,8 @@ impl MiningPoolService {
     
     // 广播工作任务给所有矿工 | Broadcast work task to all miners
     async fn broadcast_work(&self, work: WorkOrder) {
-        // 更新当前工作任务 | Update current work task
-        let context = WorkOrderContext {
+        // 更新当前工作任务上下文 | Update current work task context
+        let work_context = WorkOrderContext {
             work_id: work.work_id.clone(),
             parent_hash: work.parent_hash.clone(),
             merkle_root: work.merkle_root.clone(),
@@ -380,29 +422,53 @@ impl MiningPoolService {
             difficulty_target: work.difficulty_target.clone(),
         };
         
-        {
-            let mut current_work = self.current_work.write().await;
-            *current_work = Some(context);
-        }
-
-        // 更新状态监控器中的工作ID
+        // 更新工作ID到状态监控器
         self.status_monitor.update_work_id(work.work_id.clone()).await;
         
-        // 更新状态监控器中的难度
-        self.status_monitor.update_difficulty(hex::encode(&work.difficulty_target)).await;
-
-        // 广播给所有矿工 | Broadcast to all miners
-        info!("广播新工作任务 {} 给所有矿工 | Broadcasting new work task {} to all miners", work.work_id, work.work_id);
+        // 更新当前工作任务
+        let mut current_work = self.current_work.write().await;
+        *current_work = Some(work_context);
         
-        let miners = self.miners.clone();
-        for miner in miners.iter() {
-            let sender = &miner.work_sender;
-            if let Err(e) = sender.try_send(Ok(work.clone())) {
-                // 如果发送失败，可能矿工断开连接 | If sending fails, the miner might be disconnected
-                warn!("矿工 {} 工作任务发送失败: {} | Failed to send work task to miner {}: {}", 
-                      miner.miner_id, e, miner.miner_id, e);
+        // 广播给所有已连接的矿工 | Broadcast to all connected miners
+        let miners_count = self.miners.len();
+        let mut success_count = 0;
+        let mut failure_count = 0;
+        
+        info!("广播新工作任务给 {} 个矿工，任务ID: {} | Broadcasting new work task to {} miners, task ID: {}", 
+              miners_count, work.work_id, miners_count, work.work_id);
+        
+        for mut miner in self.miners.iter_mut() {
+            // 创建工作任务的克隆 | Create a clone of the work task
+            let work_clone = WorkOrder {
+                work_id: work.work_id.clone(),
+                parent_hash: work.parent_hash.clone(),
+                merkle_root: work.merkle_root.clone(),
+                timestamp: work.timestamp,
+                difficulty_target: work.difficulty_target.clone(),
+            };
+            
+            // 更新矿工的最后工作ID
+            miner.last_work_id = Some(work_clone.work_id.clone());
+            
+            // 发送工作任务 | Send work task
+            if let Err(e) = miner.work_sender.try_send(Ok(work_clone)) {
+                error!(
+                    "向矿工 {} 发送工作任务失败: {} | Failed to send work task to miner {}: {}", 
+                    miner.miner_id, e, miner.miner_id, e
+                );
+                failure_count += 1;
+            } else {
+                success_count += 1;
+                
+                // 更新矿工的最后活动时间
+                miner.last_active = chrono::Utc::now();
             }
         }
+        
+        info!(
+            "工作任务广播完成：成功 {}/{}，失败 {} | Work task broadcast completed: success {}/{}, failure {}", 
+            success_count, miners_count, failure_count, success_count, miners_count, failure_count
+        );
     }
 
     // 从nockchain节点生成新的工作任务 | Generate new work task from nockchain node
@@ -1151,17 +1217,55 @@ impl MiningPool for MiningPoolService {
         
         let miner_id = initial_status.miner_id.clone();
         let threads = initial_status.threads;
+        let now = chrono::Utc::now();
+        
+        // 检查是否是重连的矿工
+        let is_reconnect = self.miners.contains_key(&miner_id);
+        let session_id = if is_reconnect {
+            // 如果是重连，使用原来的会话ID
+            if let Some(miner) = self.miners.get(&miner_id) {
+                info!("矿工 {} 正在重新连接，恢复会话 {}", miner_id, miner.session_id);
+                miner.session_id.clone()
+            } else {
+                // 这种情况不应该发生，但为了安全起见
+                Uuid::new_v4().to_string()
+            }
+        } else {
+            // 新连接，生成新的会话ID
+            Uuid::new_v4().to_string()
+        };
+        
+        // 获取上一次分配的工作任务ID（用于重连恢复）
+        let last_work_id = if is_reconnect {
+            self.miners.get(&miner_id).and_then(|m| m.last_work_id.clone())
+        } else {
+            None
+        };
         
         info!(
-            "矿工 {} 已连接，使用 {} 个线程。总矿工数: {} | Miner {} connected with {} threads. Total miners: {}", 
-            miner_id, threads, self.miners.len() + 1, miner_id, threads, self.miners.len() + 1
+            "矿工 {} {} 使用 {} 个线程。总矿工数: {} | Miner {} {} with {} threads. Total miners: {}", 
+            miner_id, 
+            if is_reconnect { "重新连接" } else { "已连接" },
+            threads, 
+            self.miners.len() + (if is_reconnect { 0 } else { 1 }), 
+            miner_id, 
+            if is_reconnect { "reconnected" } else { "connected" },
+            threads, 
+            self.miners.len() + (if is_reconnect { 0 } else { 1 })
         );
         
         // 更新状态监控器中的矿工信息
-        self.status_monitor.update_miner(miner_id.clone(), threads as usize).await;
+        let reconnected = self.status_monitor.update_miner(miner_id.clone(), threads as usize).await;
+        
+        if reconnected {
+            info!("矿工 {} 成功重连，恢复之前的会话状态", miner_id);
+        }
         
         // 额外克隆一份miner_id用于后续使用
         let miner_id_for_response = miner_id.clone();
+        
+        // 获取当前工作任务ID，用于重连恢复
+        let current_work_id = self.current_work.read().await.as_ref().map(|w| w.work_id.clone());
         
         // 保存矿工连接 | Save miner connection
         self.miners.insert(
@@ -1170,6 +1274,10 @@ impl MiningPool for MiningPoolService {
                 miner_id: miner_id.clone(),
                 work_sender: tx.clone(),
                 threads,
+                session_id,
+                last_work_id: current_work_id,
+                connected_at: now,
+                last_active: now,
             },
         );
         
@@ -1182,6 +1290,7 @@ impl MiningPool for MiningPoolService {
                 // 更新矿工状态 | Update miner status
                 if let Some(mut miner) = miners.get_mut(&status.miner_id) {
                     miner.threads = status.threads;
+                    miner.last_active = chrono::Utc::now(); // 更新最后活动时间
                     
                     // 更新状态监控器中的矿工线程数
                     status_monitor.update_miner(status.miner_id.clone(), status.threads as usize).await;
@@ -1189,18 +1298,39 @@ impl MiningPool for MiningPoolService {
             }
             
             // 矿工断开连接 | Miner disconnected
-            miners.remove(&miner_id_clone);
-            
-            // 从状态监控器中移除矿工
-            status_monitor.remove_miner(&miner_id_clone);
-            
-            info!("矿工 {} 断开连接。总矿工数: {} | Miner {} disconnected. Total miners: {}", 
-                  &miner_id_clone, miners.len(), &miner_id_clone, miners.len());
+            // 注意：不立即移除矿工，让连接监控任务处理
+            if let Some(mut miner) = miners.get_mut(&miner_id_clone) {
+                info!("矿工 {} 断开连接，保持会话 {} 活跃以便重连", 
+                      &miner_id_clone, miner.session_id);
+                
+                // 只更新最后活动时间，不移除矿工记录
+                miner.last_active = chrono::Utc::now();
+                
+                // 更新矿工状态为断开连接
+                status_monitor.set_miner_disconnected(&miner_id_clone);
+            }
         });
         
         // 发送当前工作任务给新连接的矿工 | Send current work task to newly connected miner
         let current_work_read = self.current_work.read().await;
         if let Some(work_context) = &*current_work_read {
+            // 检查是否需要恢复之前的工作任务
+            let should_restore_previous_work = is_reconnect && 
+                                              last_work_id.is_some() && 
+                                              last_work_id == Some(work_context.work_id.clone());
+            
+            if should_restore_previous_work {
+                info!(
+                    "矿工 {} 重连成功，恢复之前的工作任务 {} | Miner {} reconnected, restoring previous work task {}", 
+                    miner_id, work_context.work_id, miner_id, work_context.work_id
+                );
+            } else {
+                info!(
+                    "向矿工 {} 发送当前工作任务 {} | Sending current work task {} to miner {}", 
+                    miner_id, work_context.work_id, work_context.work_id, miner_id
+                );
+            }
+            
             let work = WorkOrder {
                 work_id: work_context.work_id.clone(),
                 parent_hash: work_context.parent_hash.clone(),
@@ -1209,6 +1339,11 @@ impl MiningPool for MiningPoolService {
                 difficulty_target: work_context.difficulty_target.clone(),
             };
             
+            // 更新矿工的最后工作ID
+            if let Some(mut miner) = self.miners.get_mut(&miner_id) {
+                miner.last_work_id = Some(work.work_id.clone());
+            }
+            
             if let Err(e) = tx.try_send(Ok(work)) {
                 error!("向矿工 {} 发送初始工作任务失败: {} | Failed to send initial work task to miner {}: {}", 
                        &miner_id_for_response, e, &miner_id_for_response, e);
@@ -1216,6 +1351,12 @@ impl MiningPool for MiningPoolService {
         } else {
             // 如果没有当前工作，生成一个新的 | If there's no current work, generate a new one
             let new_work = self.generate_work().await;
+            
+            // 更新矿工的最后工作ID
+            if let Some(mut miner) = self.miners.get_mut(&miner_id) {
+                miner.last_work_id = Some(new_work.work_id.clone());
+            }
+            
             self.broadcast_work(new_work).await;
         }
         

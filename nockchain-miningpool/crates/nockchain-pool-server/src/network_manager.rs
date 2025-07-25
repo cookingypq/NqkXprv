@@ -1,7 +1,7 @@
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{info, warn, error, debug};
-use crate::error::{PoolServerError, PoolResult, ErrorSeverity};
+use crate::error::{PoolServerError, PoolResult};
 use regex::Regex;
 use std::sync::Arc;
 use crate::status_monitor::StatusMonitor;

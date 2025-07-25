@@ -89,6 +89,29 @@ pub struct MinerInfo {
     pub last_seen: DateTime<Utc>,
     pub shares_submitted: u64,
     pub shares_accepted: u64,
+    // 新增字段
+    pub session_id: String,         // 会话标识符
+    pub connection_status: MinerConnectionStatus, // 连接状态
+    pub reconnect_count: u32,       // 重连次数
+    pub first_connected_at: DateTime<Utc>, // 首次连接时间
+}
+
+// 矿工连接状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinerConnectionStatus {
+    Connected,    // 已连接
+    Disconnected, // 已断开
+    Reconnecting, // 重连中
+}
+
+impl MinerConnectionStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Connected => "已连接",
+            Self::Disconnected => "已断开",
+            Self::Reconnecting => "重连中",
+        }
+    }
 }
 
 impl StatusMonitor {
@@ -214,20 +237,81 @@ impl StatusMonitor {
         *self.work_last_update.write().await = Utc::now();
     }
 
-    // 更新矿工信息
-    pub async fn update_miner(&self, miner_id: String, threads: usize) {
+    // 更新矿工信息，支持重连
+    pub async fn update_miner(&self, miner_id: String, threads: usize) -> bool {
+        let now = Utc::now();
+        let _is_reconnect = self.miners.contains_key(&miner_id);
+        
         if let Some(mut miner) = self.miners.get_mut(&miner_id) {
+            // 现有矿工，更新信息
             miner.threads = threads;
-            miner.last_seen = Utc::now();
+            miner.last_seen = now;
+            
+            // 如果之前是断开状态，则增加重连计数
+            if miner.connection_status != MinerConnectionStatus::Connected {
+                miner.reconnect_count += 1;
+                info!("矿工 {} 已重新连接，这是第 {} 次重连", miner_id, miner.reconnect_count);
+            }
+            
+            // 更新状态为已连接
+            miner.connection_status = MinerConnectionStatus::Connected;
+            
+            true // 返回true表示是重连
         } else {
+            // 新矿工，创建记录
             self.miners.insert(miner_id.clone(), MinerInfo {
                 miner_id,
                 threads,
-                last_seen: Utc::now(),
+                last_seen: now,
                 shares_submitted: 0,
                 shares_accepted: 0,
+                session_id: uuid::Uuid::new_v4().to_string(),
+                connection_status: MinerConnectionStatus::Connected,
+                reconnect_count: 0,
+                first_connected_at: now,
             });
+            
+            false // 返回false表示是新连接
         }
+    }
+
+    // 更新矿工连接状态
+    pub fn update_miner_connection_status(&self, miner_id: &str, status: MinerConnectionStatus) {
+        if let Some(mut miner) = self.miners.get_mut(miner_id) {
+            let old_status = miner.connection_status;
+            miner.connection_status = status;
+            miner.last_seen = Utc::now();
+            
+            if old_status != status {
+                info!("矿工 {} 连接状态从 {} 变更为 {}", 
+                      miner_id, old_status.as_str(), status.as_str());
+            }
+        }
+    }
+
+    // 设置矿工为断开状态
+    pub fn set_miner_disconnected(&self, miner_id: &str) {
+        self.update_miner_connection_status(miner_id, MinerConnectionStatus::Disconnected);
+    }
+
+    // 设置矿工为重连中状态
+    pub fn set_miner_reconnecting(&self, miner_id: &str) {
+        self.update_miner_connection_status(miner_id, MinerConnectionStatus::Reconnecting);
+    }
+
+    // 获取矿工会话ID
+    pub fn get_miner_session_id(&self, miner_id: &str) -> Option<String> {
+        self.miners.get(miner_id).map(|miner| miner.session_id.clone())
+    }
+
+    // 获取矿工连接状态
+    pub fn get_miner_connection_status(&self, miner_id: &str) -> Option<MinerConnectionStatus> {
+        self.miners.get(miner_id).map(|miner| miner.connection_status)
+    }
+
+    // 获取矿工重连统计
+    pub fn get_miner_reconnect_stats(&self, miner_id: &str) -> Option<(u32, DateTime<Utc>)> {
+        self.miners.get(miner_id).map(|miner| (miner.reconnect_count, miner.first_connected_at))
     }
 
     // 矿工提交份额

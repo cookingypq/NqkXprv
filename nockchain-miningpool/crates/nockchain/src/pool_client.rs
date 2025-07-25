@@ -1,4 +1,4 @@
-use anyhow::{Result, Context};
+use anyhow::Result;
 use tokio::sync::mpsc;
 use tonic::transport::Channel;
 use tonic::Request;
