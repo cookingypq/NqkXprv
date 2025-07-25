@@ -1295,9 +1295,12 @@ async fn main() -> Result<()> {
         }
     });
     
-    // 启动HTTP API服务
+    // 启动HTTP API服务（放到 tokio::spawn 里）
     info!("启动HTTP API服务器在 {}", http_api_address);
-    http_api::start_api_server(status_monitor, &http_api_address).await;
+    let status_monitor_clone = status_monitor.clone();
+    tokio::spawn(async move {
+        http_api::start_api_server(status_monitor_clone, &http_api_address).await;
+    });
     
     // 启动gRPC服务器
     let addr = pool_server_address.parse()?;
