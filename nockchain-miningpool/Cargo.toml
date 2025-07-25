@@ -107,7 +107,9 @@ opentelemetry_sdk = { version = "0.27.1", features = ["rt-tokio"] }
 serde_bytes = { version = "0.11.15", features = ["alloc"] }
 tempfile = "3.3"
 termimad = "0.31.0"
-tonic = "0.12.3"
+tonic = "0.9"
+prost = "0.11"
+tonic-build = "0.9"
 tracing-opentelemetry = { version = "0.28.0", features = ["metrics"] }
 tracing-test = "0.2.5"
 yaque = "0.6.6"
@@ -117,11 +119,11 @@ yaque = "0.6.6"
 arrayref = "0.3.7"
 argon2 = "0.5.3"
 bardecoder = "0.5.0"
-bitcoincore-rpc = "0.19.0"
+bitcoincore-rpc = "0.17.0"
 bitvec = "1.0.1"
 bytes = "1.5.0"
 cfg-if = "1.0.0"
-clap = "4.4.4"
+clap = { version = "4.3", features = ["derive", "env"] }
 config = "0.15"
 num-traits = "0.2"
 pin-project-lite = "0.2.16"
@@ -163,15 +165,7 @@ termcolor = "1.4"
 testcontainers = { git = "https://github.com/bitemyapp/testcontainers-rs.git", rev = "54851fd9faf9b9cded9d681b46f87c056880d870" }
 thiserror = "2.0.11"
 tikv-jemallocator = { version = "0.6" }
-tokio = { version = "1.32", features = [
-    "fs",
-    "io-util",
-    "macros",
-    "net",
-    "rt-multi-thread",
-    "rt",
-    "signal",
-] }
+tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7.11"
 tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1.41"

@@ -9,11 +9,17 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, debug};
 use uuid::Uuid;
 use blake3;
+// 引入正则表达式库
+use regex::Regex;
 // 引入状态监控模块
 use crate::status_monitor::StatusMonitor;
+// 引入错误处理模块
+use crate::error::{PoolServerError, PoolResult, ErrorSeverity};
+// 引入网络管理器模块
+use crate::network_manager::{NetworkManager, RetryConfig};
 
 // 引入nockchain核心库，用于集成nockchain节点
 use kernels::dumb::KERNEL;
@@ -29,6 +35,7 @@ use nockvm_macros::tas;
 use zkvm_jetpack::hot::produce_prover_hot_state;
 use bytes::Bytes;
 use std::sync::Mutex;
+use std::time::Duration;
 
 // 简化日志初始化导入
 use nockapp::kernel::boot::init_default_tracing;
@@ -40,6 +47,8 @@ use tokio::sync::broadcast;
 // 添加新模块声明
 mod status_monitor;
 mod http_api;
+mod error;
+mod network_manager;
 
 // 定义一个静态变量来跟踪是否已经初始化
 static TRACING_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -169,15 +178,30 @@ struct MiningPoolService {
     handle: ThreadSafeNockAppHandle,
     // 状态监控器
     status_monitor: Arc<StatusMonitor>,
+    // 网络管理器
+    network_manager: Arc<NetworkManager>,
 }
 
 impl MiningPoolService {
     fn new(nockchain: NockApp) -> Self {
+        // 创建线程安全的handle
         let handle = ThreadSafeNockAppHandle::new(nockchain.get_handle());
         let status_monitor = Arc::new(StatusMonitor::new());
         
         // 启动定期状态更新
         status_monitor::StatusMonitor::start_periodic_updates(status_monitor.clone());
+        
+        // 创建网络管理器
+        let mut network_manager = NetworkManager::new(RetryConfig {
+            max_attempts: 3,
+            initial_timeout_ms: 5000,
+            retry_interval_ms: 1000,
+            use_exponential_backoff: true,
+        });
+        
+        // 设置状态监控器
+        network_manager.set_status_monitor(status_monitor.clone());
+        let network_manager = Arc::new(network_manager);
         
         let service = Self {
             miners: Arc::new(DashMap::new()),
@@ -185,81 +209,166 @@ impl MiningPoolService {
             nockchain: Arc::new(RwLock::new(nockchain)),
             handle,
             status_monitor,
+            network_manager,
         };
         
-        // 启动区块链事件监听
+        // 启动区块链事件监听器
         service.start_blockchain_event_listener();
         
         service
     }
-
-    // 启动区块链事件监听器，用于监听新区块事件
+    
+    // 启动区块链事件监听器
     fn start_blockchain_event_listener(&self) {
-        // 克隆必要的引用以便在异步任务中使用
-        let service_clone = Arc::new(self.clone());
+        let service_clone = self.clone();
         
-        // 启动异步任务监听区块链事件
         tokio::spawn(async move {
-            // 获取effect接收器，用于接收区块链事件
-            let mut effect_receiver = service_clone.handle.effect_sender.subscribe();
-            
-            info!("开始监听区块链事件 | Started listening for blockchain events");
-            
-            // 持续监听区块链事件
-            while let Ok(effect) = effect_receiver.recv().await {
-                // 检查effect是否与区块相关
-                let is_block_effect = unsafe {
-                    let root = effect.root();
-                    if let Ok(cell) = root.as_cell() {
-                        if let Ok(head) = cell.head().as_atom() {
-                            let bytes = head.to_ne_bytes();
-                            if bytes.len() >= 4 {
-                                let tag_str = String::from_utf8_lossy(&bytes[0..4]);
-                                tag_str == "fact" || tag_str == "bloc"
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                };
-
-                if is_block_effect {
-                    info!("接收到区块相关事件，检查是否需要更新工作任务");
-                }
-                
-                // 当收到任何effect时，我们检查当前链状态是否有更新
-                // 使用peek [%heavy ~] 来获取当前最新区块
-                let current_block_id = match service_clone.get_current_block_id().await {
-                    Ok(id) => id,
-                    Err(e) => {
-                        warn!("获取当前区块ID失败: {} | Failed to get current block ID: {}", e, e);
-                        continue;
-                    }
-                };
-                
-                // 检查是否需要更新工作任务
-                let should_update = {
-                    // 检查当前工作任务是否存在，以及关联的区块ID是否与最新的不同
-                    let current_work = service_clone.current_work.read().await;
-                    current_work.is_none() || service_clone.is_work_outdated(&current_block_id).await
-                };
-                
-                if should_update {
-                    // 生成新工作并广播
-                    info!("检测到区块链状态更新，生成新工作任务 | Detected blockchain state update, generating new work task");
-                    let new_work = service_clone.generate_work().await;
-                    service_clone.broadcast_work(new_work).await;
-                }
+            // 初始同步
+            match service_clone.initial_sync_with_mainnet().await {
+                true => info!("成功完成与主网的初始同步"),
+                false => warn!("与主网的初始同步未完成，将继续尝试"),
             }
             
-            warn!("区块链事件监听器已退出 | Blockchain event listener exited");
+            // 定期检查最新区块高度
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                service_clone.try_get_latest_network_height().await;
+            }
         });
     }
-
+    
+    // 尝试获取最新的网络区块高度并更新状态
+    async fn try_get_latest_network_height(&self) {
+        info!("开始检查主网最新区块高度...");
+        
+        // 使用网络管理器获取最新区块高度
+        match self.network_manager.get_latest_network_height().await {
+            Ok(height) => {
+                info!("从区块浏览器获取到的主网最新区块高度: {}", height);
+                self.status_monitor.update_network_block_height(Some(height)).await;
+            },
+            Err(e) => {
+                error!("获取主网最新区块高度失败: {}", e.to_log_string());
+                // 如果错误可恢复，设置为未知状态，否则保持当前值
+                if e.is_recoverable() {
+                    self.status_monitor.update_network_block_height(None).await;
+                    self.status_monitor.set_sync_status("同步状态未知".to_string()).await;
+                }
+            }
+        }
+    }
+    
+    // 初始同步与主网
+    async fn initial_sync_with_mainnet(&self) -> bool {
+        info!("开始与主网进行初始同步...");
+        self.status_monitor.set_sync_status("正在同步".to_string()).await;
+        
+        // 验证主网创世区块
+        match self.verify_mainnet_genesis().await {
+            Ok(true) => {
+                info!("主网创世区块验证成功");
+            },
+            Ok(false) => {
+                error!("主网创世区块验证失败");
+                self.status_monitor.set_sync_status("创世区块验证失败".to_string()).await;
+                return false;
+            },
+            Err(e) => {
+                let err = PoolServerError::from_anyhow(e);
+                error!("验证主网创世区块时出错: {}", err.to_log_string());
+                self.status_monitor.set_sync_status("创世区块验证错误".to_string()).await;
+                
+                // 如果错误不可恢复，直接返回失败
+                if !err.is_recoverable() {
+                    return false;
+                }
+                
+                // 尝试设置realnet genesis seal
+                info!("尝试设置realnet genesis seal...");
+                match self.set_realnet_genesis_seal().await {
+                    Ok(true) => {
+                        info!("成功设置realnet genesis seal");
+                    },
+                    Ok(false) => {
+                        error!("设置realnet genesis seal失败");
+                        self.status_monitor.set_sync_status("设置创世区块失败".to_string()).await;
+                        return false;
+                    },
+                    Err(e) => {
+                        let err = PoolServerError::from_anyhow(e);
+                        error!("设置realnet genesis seal时出错: {}", err.to_log_string());
+                        self.status_monitor.set_sync_status("设置创世区块错误".to_string()).await;
+                        return false;
+                    }
+                }
+            }
+        }
+        
+        // 获取当前区块高度
+        let current_height = match self.get_current_block_height().await {
+            Ok(height) => {
+                info!("当前区块高度: {}", height);
+                self.status_monitor.update_block_height(height).await;
+                height
+            },
+            Err(e) => {
+                let err = PoolServerError::from_anyhow(e);
+                error!("获取当前区块高度失败: {}", err.to_log_string());
+                self.status_monitor.set_sync_status("获取区块高度失败".to_string()).await;
+                return false;
+            }
+        };
+        
+        // 获取网络最新区块高度
+        let network_height = match self.network_manager.get_latest_network_height().await {
+            Ok(height) => {
+                info!("网络最新区块高度: {}", height);
+                self.status_monitor.update_network_block_height(Some(height)).await;
+                height
+            },
+            Err(e) => {
+                error!("获取网络最新区块高度失败: {}", e.to_log_string());
+                self.status_monitor.update_network_block_height(None).await;
+                
+                // 如果错误可恢复，使用估算值继续
+                if e.is_recoverable() {
+                    warn!("使用估算的网络区块高度");
+                    current_height + 10
+                } else {
+                    self.status_monitor.set_sync_status("获取网络高度失败".to_string()).await;
+                    return false;
+                }
+            }
+        };
+        
+        // 计算同步百分比
+        if network_height > 0 {
+            let sync_percentage = if network_height > 0 {
+                (current_height as f64 / network_height as f64) * 100.0
+            } else {
+                0.0
+            };
+            
+            info!("同步进度: {:.2}% ({}/{})", sync_percentage, current_height, network_height);
+            
+            // 更新同步状态
+            if current_height >= network_height {
+                self.status_monitor.set_sync_status("已同步".to_string()).await;
+                true
+            } else if sync_percentage > 90.0 {
+                self.status_monitor.set_sync_status(format!("同步中 ({:.2}%)", sync_percentage)).await;
+                true
+            } else {
+                self.status_monitor.set_sync_status(format!("正在同步 ({:.2}%)", sync_percentage)).await;
+                false
+            }
+        } else {
+            self.status_monitor.set_sync_status("同步状态未知".to_string()).await;
+            false
+        }
+    }
+    
     // 广播工作任务给所有矿工 | Broadcast work task to all miners
     async fn broadcast_work(&self, work: WorkOrder) {
         // 更新当前工作任务 | Update current work task
@@ -348,6 +457,9 @@ impl MiningPoolService {
         // 在非fakenet模式下，我们应该从主网获取真实的区块链状态
         // In non-fakenet mode, we should get the real blockchain state from mainnet
         
+        // 更新同步状态
+        self.status_monitor.set_sync_status("正在获取区块链状态".to_string()).await;
+        
         // 1. peek [%heavy ~] 获取 heaviest block-id
         let mut heavy_slab = NounSlab::new();
         let heavy_path = T(&mut heavy_slab, &[D(tas!(b"heavy")), D(0)]);
@@ -365,24 +477,41 @@ impl MiningPoolService {
                                 Ok(cell2) => cell2.head(),
                                 Err(e) => {
                                     warn!("获取heaviest block-id失败: {}，尝试使用环境变量", e);
+                                    self.status_monitor.set_sync_status("同步失败：无法获取区块ID".to_string()).await;
                                     return self.fallback_chain_state().await;
                                 }
                             }
                         },
                         Err(e) => {
                             warn!("获取heaviest block-id失败: {}，尝试使用环境变量", e);
+                            self.status_monitor.set_sync_status("同步失败：无法解析区块数据".to_string()).await;
                             return self.fallback_chain_state().await;
                         }
                     }
                 },
                 _ => {
                     warn!("无法获取heaviest block-id，尝试使用环境变量");
+                    self.status_monitor.set_sync_status("同步失败：无法连接主网".to_string()).await;
                     return self.fallback_chain_state().await;
                 }
             }
         };
         
         info!("成功获取到主网最新区块ID");
+        
+        // 获取区块ID的字符串表示，用于日志记录
+        let block_id_bytes = match block_id.as_atom() {
+            Ok(atom) => atom.to_ne_bytes(),
+            Err(_) => vec![]
+        };
+        let block_id_hex = if !block_id_bytes.is_empty() {
+            hex::encode(&block_id_bytes)
+        } else {
+            "未知".to_string()
+        };
+        
+        // 更新区块哈希到状态监控
+        self.status_monitor.update_block_hash(block_id_hex.clone()).await;
         
         // 2. peek [%block <block-id> ~] 获取 page
         let mut block_slab = NounSlab::new();
@@ -392,6 +521,7 @@ impl MiningPoolService {
         let res = handle.peek(block_slab).await.map_err(|e| anyhow::anyhow!("peek block failed: {e}"))?;
         let Some(slab) = res else { 
             warn!("无法获取区块页面，尝试使用环境变量");
+            self.status_monitor.set_sync_status("同步失败：无法获取区块数据".to_string()).await;
             return self.fallback_chain_state().await; 
         };
         let root = unsafe { slab.root() };
@@ -405,6 +535,7 @@ impl MiningPoolService {
             Ok(cell) => cell,
             Err(e) => {
                 warn!("无法解析区块页面: {e}，尝试使用环境变量");
+                self.status_monitor.set_sync_status("同步失败：无法解析区块数据".to_string()).await;
                 return self.fallback_chain_state().await;
             }
         };
@@ -414,11 +545,18 @@ impl MiningPoolService {
         let block_height = height_noun.as_atom().and_then(|a| a.as_u64()).unwrap_or(0);
         info!("主网当前区块高度: {}", block_height);
         
+        // 更新区块高度到状态监控
+        self.status_monitor.update_block_height(block_height).await;
+        
+        // 尝试从nockblocks.com获取当前最新区块高度
+        self.try_get_latest_network_height().await;
+        
         // 获取区块内容
         let content_cell = match page_cell.tail().as_cell() {
             Ok(cell) => cell,
             Err(e) => {
                 warn!("无法获取区块内容: {e}，尝试使用环境变量");
+                self.status_monitor.set_sync_status("同步失败：无法解析区块内容".to_string()).await;
                 return self.fallback_chain_state().await;
             }
         };
@@ -429,11 +567,16 @@ impl MiningPoolService {
             Ok(atom) => atom,
             Err(e) => {
                 warn!("无法获取目标难度: {e}，尝试使用环境变量");
+                self.status_monitor.set_sync_status("同步失败：无法获取难度目标".to_string()).await;
                 return self.fallback_chain_state().await;
             }
         };
         let target_bytes = target_atom.to_ne_bytes();
         info!("成功获取到主网目标难度");
+        
+        // 更新难度到状态监控
+        let target_hex = hex::encode(&target_bytes);
+        self.status_monitor.update_difficulty(format!("0x{}", target_hex)).await;
         
         // 获取父区块哈希
         let mut parent_hash_bytes = vec![0; 32]; // 默认值
@@ -452,7 +595,7 @@ impl MiningPoolService {
                     // 如果哈希超过32字节，截取前32字节
                     parent_hash_bytes = parent_hash_bytes[0..32].to_vec();
                 }
-                info!("成功获取到父区块哈希");
+                info!("成功获取到父区块哈希: {}", hex::encode(&parent_hash_bytes));
             }
         }
         
@@ -470,12 +613,12 @@ impl MiningPoolService {
                 // 使用blake3计算哈希作为默克尔根
                 let hash = blake3::hash(&block_id_bytes);
                 merkle_root_bytes = hash.as_bytes().to_vec();
-                info!("成功计算默克尔根");
+                info!("成功计算默克尔根: {}", hex::encode(&merkle_root_bytes));
             }
         }
         
-        // 更新状态监控器
-        self.status_monitor.update_block_height(block_height).await;
+        // 更新同步状态为成功
+        self.status_monitor.set_sync_status("同步成功".to_string()).await;
         
         info!("成功从主网获取完整的区块链状态");
         // 返回完整的区块链状态
@@ -700,6 +843,7 @@ impl MiningPoolService {
                 effect_sender: self.handle.effect_sender.clone(),
             },
             status_monitor: self.status_monitor.clone(),
+            network_manager: self.network_manager.clone(),
         }
     }
 
@@ -707,45 +851,25 @@ impl MiningPoolService {
     async fn initial_sync_with_mainnet(&self) -> bool {
         info!("开始尝试初始同步主网数据...");
         
-        // 1. 检查是否已经设置了创世区块
-        let genesis_seal_set = {
-            use nockvm::noun::{D, T};
-            // 删除这里未使用的导入
-            // use nockvm_macros::tas;
-            use nockapp::noun::slab::NounSlab;
-            
-            let mut peek_slab = NounSlab::new();
-            let tag = make_tas(&mut peek_slab, "genesis-seal-set").as_noun();
-            let peek_noun = T(&mut peek_slab, &[tag, D(0)]);
-            peek_slab.set_root(peek_noun);
-            
-            let handle = self.nockchain.read().await.get_handle();
-            match handle.peek(peek_slab).await {
-                Ok(Some(slab)) => {
-                    let genesis_seal = unsafe { slab.root() };
-                    if genesis_seal.is_atom() {
-                        unsafe { genesis_seal.raw_equals(&nockvm::noun::YES) }
-                    } else {
-                        false
-                    }
-                },
-                _ => false
-            }
-        };
-        
-        if genesis_seal_set {
-            info!("创世区块已设置，检查是否为主网创世区块");
-        } else {
-            warn!("未检测到创世区块设置，将尝试设置主网创世区块");
-            // 尝试设置主网创世区块
-            match self.set_realnet_genesis_seal().await {
-                Ok(true) => info!("成功设置主网创世区块"),
-                Ok(false) => warn!("设置主网创世区块失败"),
-                Err(e) => error!("设置主网创世区块时发生错误: {}", e),
+        // **关键步骤**：首先验证并设置正确的主网创世区块
+        info!("正在验证主网创世区块设置...");
+        match self.verify_mainnet_genesis().await {
+            Ok(true) => info!("主网创世区块已正确设置。"),
+            Ok(false) => {
+                warn!("主网创世区块设置不正确或未设置，正在尝试修复...");
+                if let Err(e) = self.set_realnet_genesis_seal().await {
+                    error!("无法设置主网创世区块，同步可能会失败: {}", e);
+                    return false; // 如果无法设置创世区块，则同步无法继续
+                }
+            },
+            Err(e) => {
+                error!("验证主网创世区块时出错: {}", e);
+                return false;
             }
         }
         
         // 2. 尝试获取区块链状态
+        info!("尝试从主网获取最新的区块链状态...");
         match self.get_chain_state().await {
             Ok((_, _, _)) => {
                 info!("成功获取主网区块链状态");
@@ -761,8 +885,6 @@ impl MiningPoolService {
     // 设置主网创世区块的辅助方法
     async fn set_realnet_genesis_seal(&self) -> Result<bool, anyhow::Error> {
         use nockvm::noun::{D, T};
-        // 删除未使用的导入
-        // use nockvm_macros::tas;
         use nockapp::noun::slab::NounSlab;
         use nockapp::ToBytes;
         
@@ -808,8 +930,6 @@ impl MiningPoolService {
     // 验证当前系统是否正确使用了主网创世区块
     async fn verify_mainnet_genesis(&self) -> Result<bool, anyhow::Error> {
         use nockvm::noun::{D, T};
-        // 删除未使用的导入
-        // use nockvm_macros::tas;
         use nockapp::noun::slab::NounSlab;
         
         // 检查是否设置了创世区块
@@ -867,6 +987,193 @@ impl MiningPoolService {
         }
         
         Ok(false)
+    }
+
+    // 尝试从nockblocks.com获取最新区块高度
+    async fn try_get_latest_network_height(&self) {
+        // 使用reqwest库获取最新区块高度
+        // 这个功能需要添加reqwest依赖
+        match self.fetch_latest_network_data().await {
+            Ok(height) => {
+                info!("从区块浏览器获取到的主网最新区块高度: {}", height);
+                self.status_monitor.update_network_block_height(Some(height)).await;
+            },
+            Err(e) => {
+                warn!("获取主网最新区块高度失败: {}", e);
+                // 保持当前值不变
+            }
+        }
+    }
+
+    // 尝试从nockblocks.com获取最新区块数据
+    async fn fetch_latest_network_data(&self) -> Result<u64, anyhow::Error> {
+        // 首先检查环境变量，如果设置了MOCK_NETWORK_BLOCK_HEIGHT，则使用它（用于测试）
+        if let Ok(height_str) = std::env::var("MOCK_NETWORK_BLOCK_HEIGHT") {
+            if let Ok(height) = height_str.parse::<u64>() {
+                info!("使用环境变量中设置的模拟网络区块高度: {}", height);
+                return Ok(height);
+            }
+        }
+        
+        info!("从nockblocks.com获取最新区块高度...");
+        
+        // 重试配置
+        let max_retries = 3;
+        let initial_timeout = 15;
+        let mut last_error = None;
+        
+        for attempt in 1..=max_retries {
+            // 根据尝试次数增加超时时间
+            let timeout_secs = initial_timeout * attempt;
+            
+            info!("尝试获取网络区块高度 (尝试 {}/{}，超时 {}秒)", attempt, max_retries, timeout_secs);
+            
+            // 创建HTTP客户端
+            let client = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(timeout_secs as u64))
+                .build() {
+                    Ok(client) => client,
+                    Err(e) => {
+                        let err = PoolServerError::NetworkError(format!("创建HTTP客户端失败: {}", e));
+                        error!("{}", err.to_log_string());
+                        last_error = Some(anyhow::anyhow!(err));
+                        continue;
+                    }
+                };
+                
+            // 获取网页内容
+            let response_result = client.get("https://nockblocks.com/blocks")
+                .header("User-Agent", "Mozilla/5.0 Nockchain-Pool-Server/0.1.0")
+                .send()
+                .await;
+                
+            match response_result {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        match response.text().await {
+                            Ok(html_content) => {
+                                // 直接寻找"Latest Block"或"latest block"标记
+                                let latest_block_regex = Regex::new(r"[Ll]atest [Bb]lock.*?(\d+)").unwrap();
+                                if let Some(captures) = latest_block_regex.captures(&html_content) {
+                                    if let Some(height_match) = captures.get(1) {
+                                        if let Ok(height) = height_match.as_str().parse::<u64>() {
+                                            info!("成功提取最新区块高度: {}", height);
+                                            return Ok(height);
+                                        } else {
+                                            let err = PoolServerError::DataError("无法将提取的区块高度解析为数字".to_string());
+                                            warn!("{}", err.to_log_string());
+                                            last_error = Some(anyhow::anyhow!(err));
+                                        }
+                                    } else {
+                                        let err = PoolServerError::DataError("未能提取区块高度数字".to_string());
+                                        warn!("{}", err.to_log_string());
+                                        last_error = Some(anyhow::anyhow!(err));
+                                    }
+                                } else {
+                                    let err = PoolServerError::DataError("未找到区块高度信息".to_string());
+                                    warn!("{}", err.to_log_string());
+                                    last_error = Some(anyhow::anyhow!(err));
+                                }
+                            },
+                            Err(e) => {
+                                let err = PoolServerError::NetworkError(format!("读取响应内容失败: {}", e));
+                                warn!("{}", err.to_log_string());
+                                last_error = Some(anyhow::anyhow!(err));
+                            }
+                        }
+                    } else {
+                        let err = PoolServerError::NetworkError(format!("HTTP请求失败，状态码: {}", response.status()));
+                        warn!("{}", err.to_log_string());
+                        last_error = Some(anyhow::anyhow!(err));
+                    }
+                },
+                Err(e) => {
+                    let err = PoolServerError::NetworkError(format!("发送HTTP请求失败: {}", e));
+                    warn!("{}", err.to_log_string());
+                    last_error = Some(anyhow::anyhow!(err));
+                }
+            }
+            
+            // 如果不是最后一次尝试，则等待一段时间后重试
+            if attempt < max_retries {
+                let wait_time = attempt * 2; // 指数退避
+                info!("等待 {}秒 后重试...", wait_time);
+                tokio::time::sleep(std::time::Duration::from_secs(wait_time)).await;
+            }
+        }
+        
+        // 如果所有尝试都失败，使用备用方法
+        warn!("无法从nockblocks.com获取最新区块高度，使用估算值");
+        
+        // 记录最后一个错误
+        if let Some(err) = last_error {
+            debug!("获取网络高度失败的详细错误: {}", err);
+        }
+        
+        // 使用备用方法：当前区块高度+偏移值
+        let current_height = self.status_monitor.get_statistics().await.current_block_height;
+        let estimated_height = current_height + 10; // 估算网络高度比本地高10个区块
+        info!("使用估算的网络区块高度: {}", estimated_height);
+        Ok(estimated_height)
+    }
+
+    // 添加获取当前区块高度的方法
+    async fn get_current_block_height(&self) -> Result<u64, anyhow::Error> {
+        use nockvm::noun::{D, T};
+        use nockvm_macros::tas;
+        use nockapp::noun::slab::NounSlab;
+        
+        // 获取当前区块高度
+        let mut heavy_slab = NounSlab::new();
+        let heavy_path = T(&mut heavy_slab, &[D(tas!(b"heavy")), D(0)]);
+        heavy_slab.set_root(heavy_path);
+        
+        let handle = self.nockchain.read().await.get_handle();
+        match handle.peek(heavy_slab).await {
+            Ok(Some(slab)) => {
+                let root = unsafe { slab.root() };
+                
+                // 解包两层 Some 以获取block_id
+                match root.as_cell() {
+                    Ok(cell1) => {
+                        match cell1.tail().as_cell() {
+                            Ok(cell2) => {
+                                let block_id = cell2.head();
+                                
+                                // 获取区块信息
+                                let mut block_slab = NounSlab::new();
+                                let block_path = T(&mut block_slab, &[D(tas!(b"block")), block_id, D(0)]);
+                                block_slab.set_root(block_path);
+                                
+                                match handle.peek(block_slab).await {
+                                    Ok(Some(slab)) => {
+                                        let root = unsafe { slab.root() };
+                                        match root.as_cell() {
+                                            Ok(page_cell) => {
+                                                // 获取区块高度
+                                                let height_noun = page_cell.head();
+                                                if let Ok(height) = height_noun.as_atom().and_then(|a| a.as_u64()) {
+                                                    return Ok(height);
+                                                }
+                                            },
+                                            Err(e) => return Err(anyhow::anyhow!("解析区块页面失败: {}", e))
+                                        }
+                                    },
+                                    Ok(None) => return Err(anyhow::anyhow!("未找到区块信息")),
+                                    Err(e) => return Err(anyhow::anyhow!("获取区块信息失败: {}", e))
+                                }
+                            },
+                            Err(e) => return Err(anyhow::anyhow!("解析heavy cell失败: {}", e))
+                        }
+                    },
+                    Err(e) => return Err(anyhow::anyhow!("解析heavy root失败: {}", e))
+                }
+            },
+            Ok(None) => return Err(anyhow::anyhow!("未找到heavy区块")),
+            Err(e) => return Err(anyhow::anyhow!("获取heavy区块失败: {}", e))
+        }
+        
+        Err(anyhow::anyhow!("无法获取当前区块高度"))
     }
 }
 
@@ -1153,11 +1460,11 @@ async fn main() -> Result<()> {
         mine: false,
         mining_pubkey: Some(mining_pubkey.clone()),
         mining_key_adv: None,
-        fakenet: false,  // 确保fakenet设置为false以连接到主网
-        peer: vec!["/ip4/121.61.204.239/udp/3006/quic-v1/p2p/12D3KooWEjQcZUS3x5YEMuMj1kgZJyoV4MTHNRnbtbSEMAMzwGQC".to_string()],
+        fakenet: false,
+        // 将已知节点放回peer列表，依赖nockchain内部的重连逻辑
+        peer: vec!["/dns4/p2p-mainnet.urbit.org/udp/30006/quic-v1/p2p/12D3KooWEjQcZUS3x5YEMuMj1kgZJyoV4MTHNRnbtbSEMAMzwGQC".to_string()],
         force_peer: vec![],
-        allowed_peers_path: None,
-        no_default_peers: false,  // 确保连接到默认节点
+        no_default_peers: false, // 恢复默认，使其尝试连接peer列表
         bind: vec![
             "/ip4/0.0.0.0/udp/13340/quic-v1".to_string()
         ],
@@ -1203,6 +1510,12 @@ async fn main() -> Result<()> {
     // 初始化矿池服务
     let service = MiningPoolService::new(nockapp);
     
+    // 移除手动引导任务，因为它无法实际工作
+    // let service_clone_for_bootstrap = Arc::new(service.clone());
+    // tokio::spawn(async move {
+    //     bootstrap_network(service_clone_for_bootstrap).await;
+    // });
+
     // 获取对状态监控器的引用，用于HTTP API
     let status_monitor = service.status_monitor.clone();
     
@@ -1217,6 +1530,13 @@ async fn main() -> Result<()> {
     // 生成初始工作任务
     let initial_work = service.generate_work().await;
     service.broadcast_work(initial_work).await;
+    
+    // 立即打印一次初始状态
+    info!("===== 初始同步状态 =====");
+    let initial_stats = status_monitor.get_statistics().await;
+    info!("区块高度: {}/{:?}", initial_stats.current_block_height, initial_stats.network_latest_block_height.unwrap_or(0));
+    info!("同步状态: {} ({:.2}%)", initial_stats.sync_status, initial_stats.sync_percentage);
+    info!("========================");
     
     // 启动定期检查区块链状态的任务
     // 这是一个额外的保障机制，防止事件监听器错过某些更新
@@ -1236,61 +1556,60 @@ async fn main() -> Result<()> {
             
             let now = std::time::Instant::now();
             let elapsed = now.duration_since(last_check_time).as_secs();
-            
-            info!("执行定期区块链状态检查 | Performing periodic blockchain state check ({}秒后)", elapsed);
             last_check_time = now;
+
+            // info!("执行定期区块链状态检查 ({}秒后)...", elapsed); // 此日志过于频繁，暂时注释
             
-            // 获取当前区块ID
-            let current_block_id = match service_clone.get_current_block_id().await {
-                Ok(id) => id,
+            // 直接获取最新区块ID，并与上次记录的ID比较
+            match service_clone.get_current_block_id().await {
+                Ok(current_block_id) => {
+                    let block_changed = last_block_id.as_ref() != Some(&current_block_id);
+
+                    if block_changed {
+                        info!("检测到新区块，更新状态并触发新工作...");
+                        last_block_id = Some(current_block_id.clone());
+
+                        // 1. 更新状态监控器
+                        let block_id_hex = hex::encode(&current_block_id);
+                        service_clone.status_monitor.update_block_hash(block_id_hex).await;
+                        if let Ok(height) = service_clone.get_current_block_height().await {
+                            service_clone.status_monitor.update_block_height(height).await;
+                        }
+                        service_clone.try_get_latest_network_height().await;
+
+                        // 打印详细的进度更新
+                        let stats = service_clone.status_monitor.get_statistics().await;
+                        info!("同步进度: 本地区块 {} / 网络区块 {:?} ({}%)", 
+                              stats.current_block_height, 
+                              stats.network_latest_block_height.unwrap_or(0),
+                              format!("{:.2}", stats.sync_percentage));
+
+                        // 2. 触发新工作广播
+                        let new_work = service_clone.generate_work().await;
+                        service_clone.broadcast_work(new_work).await;
+                    } else {
+                        // info!("区块链状态无变化。"); // 此日志过于频繁，暂时注释
+                    }
+                },
                 Err(e) => {
-                    warn!("定期检查：获取区块ID失败: {} | Periodic check: failed to get block ID: {}", e, e);
-                    continue;
+                    warn!("定期检查：获取区块ID失败: {}", e);
                 }
             };
-            
-            // 检查区块ID是否发生变化
-            let block_changed = match &last_block_id {
-                Some(last_id) => last_id != &current_block_id,
-                None => true, // 首次运行视为变化
-            };
-            
-            if block_changed {
-                info!("定期检查：检测到新区块");
-                last_block_id = Some(current_block_id.clone());
-            }
-            
-            // 检查当前工作是否过时
-            if block_changed || service_clone.is_work_outdated(&current_block_id).await {
-                // 如果过时，生成新工作并广播
-                info!("定期检查发现区块链状态更新，生成新工作 | Periodic check detected blockchain state update, generating new work");
-                let new_work = service_clone.generate_work().await;
-                service_clone.broadcast_work(new_work).await;
-            } else {
-                info!("定期检查：当前工作仍然有效 | Periodic check: current work is still valid");
-            }
-            
-            // 额外检查系统连接状态
-            let has_miners = !service_clone.miners.is_empty();
-            if has_miners {
-                let count = service_clone.miners.len();
-                info!("定期检查：当前有 {} 个矿工连接", count);
-            } else {
-                info!("定期检查：当前没有矿工连接");
-            }
-            
-            // 每60秒验证一次创世区块信息
-            if now.duration_since(last_check_time).as_secs() >= 60 {
-                tokio::spawn({
-                    let service_clone = service_clone.clone();
-                    async move {
-                        match service_clone.verify_mainnet_genesis().await {
-                            Ok(true) => info!("验证主网创世区块：状态正常"),
-                            Ok(false) => warn!("验证主网创世区块：检测到配置错误，将尝试修复"),
-                            Err(e) => error!("验证主网创世区块时出错: {}", e),
-                        }
-                    }
-                });
+
+            // 每60秒尝试更新一次网络高度，并打印状态摘要
+            if elapsed >= 60 {
+                info!("执行主网区块高度检查...");
+                service_clone.try_get_latest_network_height().await;
+
+                // 打印状态摘要
+                let stats = service_clone.status_monitor.get_statistics().await;
+                info!("===== 状态摘要 =====");
+                info!("  同步进度: 本地区块 {} / 网络区块 {:?} ({}%)", 
+                      stats.current_block_height, 
+                      stats.network_latest_block_height.unwrap_or(0),
+                      format!("{:.2}", stats.sync_percentage));
+                info!("  连接矿工: {}, 总线程数: {}", stats.connected_miners, stats.total_threads);
+                info!("=====================");
             }
         }
     });
@@ -1313,3 +1632,6 @@ async fn main() -> Result<()> {
     
     Ok(())
 } 
+
+// 移除无法实现的手动引导函数
+// async fn bootstrap_network(service: Arc<MiningPoolService>) { ... } 

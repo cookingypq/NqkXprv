@@ -1,9 +1,8 @@
 [package]
 name = "nockchain"
-build = "build.rs"
-publish = false
-version.workspace = true
+version = "0.2.0"
 edition.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "miner"
@@ -12,18 +11,17 @@ path = "src/main.rs"
 [features]
 bazel_build = []
 jemalloc = ["tikv-jemallocator"]
-pool_client = [] # 矿池客户端模式 | Pool client mode
 
 [dependencies]
 hoonc.workspace = true
-kernels = { workspace = true, features = ["dumb", "miner"] }
-nockapp.workspace = true
+kernels = { path = "../kernels", features = ["miner", "dumb"] }
+nockapp = { path = "../nockapp" }
 nockvm.workspace = true
 nockvm_macros.workspace = true
 
 bitcoincore-rpc.workspace = true
 bs58.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
 equix = "0.2.2" # 确保版本正确，这个版本有Solver结构体
 futures.workspace = true
 ibig.workspace = true
@@ -46,17 +44,17 @@ tikv-jemallocator = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 tracing-test.workspace = true
-num_cpus = { workspace = true }
+num_cpus = "1.15"
 rand = { workspace = true }
 
 # 新增gRPC客户端依赖 | Add gRPC client dependencies
-tonic = { version = "0.9", features = ["gzip"] }
-prost = "0.11"
+tonic = { workspace = true }
+prost = { workspace = true }
 uuid = { version = "1.3", features = ["v4"] }
 chrono = "0.4"
-anyhow = "1.0"
+anyhow = { workspace = true }
 blake3 = "1.5.0" # 添加blake3依赖
-async-stream = "0.3.5" # 添加async-stream依赖
+async-stream = "0.3" # 添加async-stream依赖
 hex = "0.4.3" # 可能需要用于比较哈希值
 
 zkvm-jetpack.workspace = true
@@ -70,4 +68,4 @@ vergen = { workspace = true, features = [
     "rustc",
     "si",
 ] }
-tonic-build = "0.9"
+tonic-build = { workspace = true }

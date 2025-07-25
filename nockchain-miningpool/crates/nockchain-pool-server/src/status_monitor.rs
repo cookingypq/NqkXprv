@@ -17,6 +17,12 @@ pub struct PoolStatistics {
     // 区块链信息
     pub current_block_height: u64,
     pub last_block_time: Option<DateTime<Utc>>,
+    pub latest_block_hash: String,
+    
+    // 同步状态信息
+    pub sync_status: String,
+    pub sync_percentage: f64,
+    pub network_latest_block_height: Option<u64>,
     
     // 矿工信息
     pub connected_miners: usize,
@@ -46,6 +52,12 @@ pub struct StatusMonitor {
     // 区块链状态
     current_block_height: AtomicU64,
     last_block_time: RwLock<Option<DateTime<Utc>>>,
+    latest_block_hash: RwLock<String>,
+    
+    // 同步状态
+    sync_status: RwLock<String>,
+    sync_percentage: RwLock<f64>,
+    network_latest_block_height: RwLock<Option<u64>>,
     
     // 矿工状态
     miners: Arc<DashMap<String, MinerInfo>>,
@@ -86,6 +98,10 @@ impl StatusMonitor {
             server_start_time: now.clone(),
             current_block_height: AtomicU64::new(0),
             last_block_time: RwLock::new(None),
+            latest_block_hash: RwLock::new("未知".to_string()),
+            sync_status: RwLock::new("初始化".to_string()),
+            sync_percentage: RwLock::new(0.0),
+            network_latest_block_height: RwLock::new(None),
             miners: Arc::new(DashMap::new()),
             blocks_found: AtomicU64::new(0),
             blocks_accepted: AtomicU64::new(0),
@@ -106,6 +122,78 @@ impl StatusMonitor {
         if old_height != height {
             *self.last_block_time.write().await = Some(Utc::now());
             info!("区块高度更新: {} -> {}", old_height, height);
+            
+            // 更新同步状态
+            self.update_sync_status().await;
+        }
+    }
+
+    // 更新最新区块哈希
+    pub async fn update_block_hash(&self, hash: String) {
+        let mut current = self.latest_block_hash.write().await;
+        if *current != hash {
+            info!("区块哈希更新: {} -> {}", *current, hash);
+            *current = hash;
+        }
+    }
+
+    // 更新网络最新区块高度
+    pub async fn update_network_block_height(&self, height: Option<u64>) {
+        let mut current = self.network_latest_block_height.write().await;
+        if *current != height {
+            if let Some(h) = height {
+                info!("网络区块高度更新: {:?} -> {}", *current, h);
+            } else {
+                info!("网络区块高度更新: {:?} -> 未知", *current);
+            }
+            *current = height;
+            
+            // 更新同步状态
+            self.update_sync_status().await;
+        }
+    }
+
+    // 更新同步状态
+    async fn update_sync_status(&self) {
+        let current_height = self.current_block_height.load(Ordering::SeqCst);
+        let network_height = *self.network_latest_block_height.read().await;
+        
+        let (status, percentage) = match network_height {
+            Some(network_height) => {
+                if current_height >= network_height {
+                    ("同步完成".to_string(), 100.0)
+                } else if network_height > 0 {
+                    let percentage = (current_height as f64 / network_height as f64) * 100.0;
+                    (format!("正在同步 ({:.2}%)", percentage), percentage)
+                } else {
+                    ("等待同步".to_string(), 0.0)
+                }
+            },
+            None => {
+                if current_height > 0 {
+                    ("部分同步".to_string(), 0.0)
+                } else {
+                    ("等待同步".to_string(), 0.0)
+                }
+            }
+        };
+        
+        let mut current_status = self.sync_status.write().await;
+        let mut current_percentage = self.sync_percentage.write().await;
+        
+        if *current_status != status || (*current_percentage - percentage).abs() > 0.01 {
+            info!("同步状态更新: {} -> {} (进度: {:.2}%)", *current_status, status, percentage);
+            *current_status = status;
+            *current_percentage = percentage;
+        }
+    }
+
+    // 设置同步状态
+    pub async fn set_sync_status(&self, status: String) {
+        let mut current = self.sync_status.write().await;
+        if *current != status {
+            info!("同步状态更新: {} -> {}", *current, status);
+            *current = status;
         }
     }
 
@@ -239,6 +327,10 @@ impl StatusMonitor {
             uptime_seconds,
             current_block_height: self.current_block_height.load(Ordering::SeqCst),
             last_block_time: *self.last_block_time.read().await,
+            latest_block_hash: self.latest_block_hash.read().await.clone(),
+            sync_status: self.sync_status.read().await.clone(),
+            sync_percentage: *self.sync_percentage.read().await,
+            network_latest_block_height: *self.network_latest_block_height.read().await,
             connected_miners: self.miners.len(),
             total_threads,
             estimated_hashrate: hashrate,
@@ -289,14 +381,22 @@ impl StatusMonitor {
             });
         }
         
-        // 移除定期状态摘要打印
+        // 移除定期状态摘要打印，由主循环控制
         // {
         //     let monitor_clone = monitor.clone();
         //     tokio::spawn(async move {
         //         let mut interval = tokio::time::interval(Duration::from_secs(status_log_interval));
         //         loop {
         //             interval.tick().await;
-        //             monitor_clone.print_status_summary().await;
+        //             let stats = monitor_clone.get_statistics().await;
+        //             info!("===== 同步状态摘要 =====");
+        //             info!("区块高度: {}/{:?}", 
+        //                 stats.current_block_height, 
+        //                 stats.network_latest_block_height.unwrap_or(0));
+        //             info!("同步状态: {} ({:.2}%)", stats.sync_status, stats.sync_percentage);
+        //             info!("最新区块: {}", stats.latest_block_hash);
+        //             info!("区块时间: {:?}", stats.last_block_time);
+        //             info!("========================");
         //         }
         //     });
         // }
