@@ -51,15 +51,22 @@ async fn run_pool_mode(server_address: String, threads_opt: Option<u32>) -> Resu
     use nockchain::pool_client::{PoolClient, PoolClientConfig};
     use uuid::Uuid;
 
-    let threads = threads_opt.unwrap_or_else(num_cpus::get_physical);
+    // 修复类型不匹配错误：将usize转换为u32
+    let threads = threads_opt.unwrap_or_else(|| num_cpus::get_physical() as u32);
     let miner_id = Uuid::new_v4().to_string();
 
     tracing::info!("矿工ID: {}, 使用线程数: {}", miner_id, threads);
 
+    // 补充缺失的字段
     let config = PoolClientConfig {
         server_address,
-        threads: threads as u32,
+        threads,
         miner_id,
+        backup_servers: vec![], // 添加备用服务器列表
+        connection_retry_attempts: 3, // 添加重试次数
+        connection_retry_delay_ms: 1000, // 添加重试延迟
+        connection_timeout_ms: 30000, // 修正字段名称：会话超时
+        request_timeout_ms: 10000, // 添加请求超时
     };
 
     let client = PoolClient::new(config).await?;
