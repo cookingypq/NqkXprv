@@ -113,9 +113,11 @@ impl PoolClient {
     
     // 连接服务器，带有重试机制
     async fn connect_with_retry(config: &PoolClientConfig) -> Result<(MiningPoolClient<Channel>, String)> {
-        let mut last_error = None;
-        let mut servers = vec![config.server_address.clone()];
-        servers.extend(config.backup_servers.clone());
+        let servers = std::iter::once(config.server_address.clone())
+            .chain(config.backup_servers.clone())
+            .collect::<Vec<_>>();
+            
+        let mut last_error: Option<anyhow::Error> = None;
         
         for server in &servers {
             for attempt in 1..=config.connection_retry_attempts {
@@ -131,7 +133,7 @@ impl PoolClient {
                     },
                     Ok(Err(e)) => {
                         warn!("连接到矿池服务器 {} 失败: {}", server, e);
-                        last_error = Some(e);
+                        last_error = Some(anyhow::anyhow!("连接失败: {}", e));
                     },
                     Err(_) => {
                         warn!("连接到矿池服务器 {} 超时", server);
@@ -148,7 +150,9 @@ impl PoolClient {
         }
         
         // 如果所有服务器都连接失败，返回最后一个错误
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("无法连接到任何矿池服务器")))
+        Err(last_error.unwrap_or_else(|| {
+            anyhow::anyhow!("无法连接到任何矿池服务器")
+        }))
     }
     
     // 重新连接到服务器
@@ -168,22 +172,30 @@ impl PoolClient {
 
     pub async fn run(mut self) -> Result<()> {
         // 创建一个初始的MinerStatus流，只发送一次
-        let initial_status = MinerStatus {
+        let initial_status_template = MinerStatus {
             miner_id: self.config.miner_id.clone(),
             threads: self.config.threads,
         };
-        let request_stream = async_stream::stream! {
-            yield initial_status;
-            // 在此之后流保持打开，但不再发送任何内容
-        };
-
+        
         // 订阅服务器，带有重试机制
         let mut retry_count = 0;
         let max_retries = self.config.connection_retry_attempts;
         let mut stream = loop {
+            // 每次循环创建一个新的stream，使用模板克隆一个新的status
+            // 每次循环都克隆一次miner_id，避免移动
+            let miner_id_clone = initial_status_template.miner_id.clone();
+            let threads = initial_status_template.threads;
+            let request_stream = async_stream::stream! {
+                yield MinerStatus {
+                    miner_id: miner_id_clone,
+                    threads: threads,
+                };
+                // 在此之后流保持打开，但不再发送任何内容
+            };
+            
             match timeout(
                 Duration::from_millis(self.config.request_timeout_ms),
-                self.client.subscribe(Request::new(request_stream.clone()))
+                self.client.subscribe(Request::new(request_stream))
             ).await {
                 Ok(Ok(response)) => {
                     info!("成功订阅矿池服务器");
@@ -238,7 +250,7 @@ impl PoolClient {
                     
                     // 在一个新任务中处理挖矿，以避免阻塞主循环
                     let threads = self.config.threads;
-                    let miner_id = self.config.miner_id.clone();
+                    let miner_id = self.config.miner_id.clone(); // 克隆一次，避免多次移动
                     let mut client_clone = self.client.clone();
                     let request_timeout_ms = self.config.request_timeout_ms;
 
@@ -290,10 +302,13 @@ impl PoolClient {
                     }
                     
                     // 重新订阅
+                    // 克隆一次miner_id，避免移动
+                    let miner_id_clone = self.config.miner_id.clone();
+                    let threads = self.config.threads;
                     let request_stream = async_stream::stream! {
                         yield MinerStatus {
-                            miner_id: self.config.miner_id.clone(),
-                            threads: self.config.threads,
+                            miner_id: miner_id_clone,
+                            threads: threads,
                         };
                     };
                     

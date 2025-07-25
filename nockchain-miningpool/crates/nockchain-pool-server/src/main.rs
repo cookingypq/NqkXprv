@@ -604,7 +604,7 @@ impl MiningPoolService {
         
         // 尝试获取交易列表
         if let Ok(txs_cell) = content_cell.tail().as_cell() {
-            if let Ok(txs_list) = txs_cell.tail().as_cell() {
+            if let Ok(_txs_list) = txs_cell.tail().as_cell() {
                 // 这里应该遍历交易列表并计算默克尔根
                 // 但由于结构可能很复杂，我们简化为使用区块ID的哈希作为默克尔根
                 let block_id_atom = block_id.as_atom().unwrap_or_else(|_| Atom::from_value(&mut NounSlab::<nockapp::noun::slab::NockJammer>::new(), 0).unwrap());
@@ -847,40 +847,7 @@ impl MiningPoolService {
         }
     }
 
-    // 添加一个初始同步方法，用于服务启动时
-    async fn initial_sync_with_mainnet(&self) -> bool {
-        info!("开始尝试初始同步主网数据...");
-        
-        // **关键步骤**：首先验证并设置正确的主网创世区块
-        info!("正在验证主网创世区块设置...");
-        match self.verify_mainnet_genesis().await {
-            Ok(true) => info!("主网创世区块已正确设置。"),
-            Ok(false) => {
-                warn!("主网创世区块设置不正确或未设置，正在尝试修复...");
-                if let Err(e) = self.set_realnet_genesis_seal().await {
-                    error!("无法设置主网创世区块，同步可能会失败: {}", e);
-                    return false; // 如果无法设置创世区块，则同步无法继续
-                }
-            },
-            Err(e) => {
-                error!("验证主网创世区块时出错: {}", e);
-                return false;
-            }
-        }
-        
-        // 2. 尝试获取区块链状态
-        info!("尝试从主网获取最新的区块链状态...");
-        match self.get_chain_state().await {
-            Ok((_, _, _)) => {
-                info!("成功获取主网区块链状态");
-                true
-            },
-            Err(e) => {
-                error!("获取主网区块链状态失败: {}", e);
-                false
-            }
-        }
-    }
+    // 这个函数已在第263行定义，此处删除重复定义
     
     // 设置主网创世区块的辅助方法
     async fn set_realnet_genesis_seal(&self) -> Result<bool, anyhow::Error> {
@@ -989,21 +956,7 @@ impl MiningPoolService {
         Ok(false)
     }
 
-    // 尝试从nockblocks.com获取最新区块高度
-    async fn try_get_latest_network_height(&self) {
-        // 使用reqwest库获取最新区块高度
-        // 这个功能需要添加reqwest依赖
-        match self.fetch_latest_network_data().await {
-            Ok(height) => {
-                info!("从区块浏览器获取到的主网最新区块高度: {}", height);
-                self.status_monitor.update_network_block_height(Some(height)).await;
-            },
-            Err(e) => {
-                warn!("获取主网最新区块高度失败: {}", e);
-                // 保持当前值不变
-            }
-        }
-    }
+    // 这个函数已在第242行定义，此处删除重复定义
 
     // 尝试从nockblocks.com获取最新区块数据
     async fn fetch_latest_network_data(&self) -> Result<u64, anyhow::Error> {
@@ -1464,6 +1417,7 @@ async fn main() -> Result<()> {
         // 将已知节点放回peer列表，依赖nockchain内部的重连逻辑
         peer: vec!["/dns4/p2p-mainnet.urbit.org/udp/30006/quic-v1/p2p/12D3KooWEjQcZUS3x5YEMuMj1kgZJyoV4MTHNRnbtbSEMAMzwGQC".to_string()],
         force_peer: vec![],
+        allowed_peers_path: None,
         no_default_peers: false, // 恢复默认，使其尝试连接peer列表
         bind: vec![
             "/ip4/0.0.0.0/udp/13340/quic-v1".to_string()

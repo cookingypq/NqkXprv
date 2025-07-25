@@ -26,7 +26,7 @@ blake3 = "1.3"
 hex = "0.4"
 rand = "0.8.5"
 zkvm-jetpack = { path = "../zkvm-jetpack" }
-kernels = { path = "../kernels", features = ["miner"] }
+kernels = { path = "../kernels", features = ["miner", "dumb"] }
 nockapp = { path = "../nockapp" }
 nockvm = { path = "../nockvm/rust/nockvm" }
 nockvm_macros = { path = "../nockvm/rust/nockvm_macros" }
@@ -41,7 +41,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 humantime = "2.1"
 # 添加HTTP客户端依赖，用于从nockblocks.com获取区块数据
-reqwest = { version = "0.11", features = ["json", "timeout"] }
+reqwest = { version = "0.11", features = ["json"] }
 # 添加HTML解析依赖，用于从网页提取区块数据
 scraper = "0.18.1"
 regex = "1.10.2"
