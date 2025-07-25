@@ -840,12 +840,15 @@ async fn main() -> Result<()> {
         mine: false,
         mining_pubkey: Some(mining_pubkey.clone()),
         mining_key_adv: None,
-        fakenet: true,  // 使用fakenet模式来简化测试
-        peer: vec![],
+        fakenet: false,  // 使用fakenet模式来简化测试
+        peer: vec!["/ip4/121.61.204.239/udp/3006/quic-v1/p2p/12D3KooWEjQcZUS3x5YEMuMj1kgZJyoV4MTHNRnbtbSEMAMzwGQC".to_string()],
         force_peer: vec![],
         allowed_peers_path: None,
-        no_default_peers: true,  // 不连接默认节点
-        bind: vec![],
+        no_default_peers: false,  // 不连接默认节点
+        bind: vec![
+            "/ip4/0.0.0.0/tcp/13340".to_string(),
+            "/ip4/0.0.0.0/udp/13340/quic-v1".to_string()
+        ],
         new_peer_id: false,
         max_established_incoming: None,
         max_established_outgoing: None,
@@ -857,8 +860,8 @@ async fn main() -> Result<()> {
         max_system_memory_fraction: None,
         max_system_memory_bytes: None,
         num_threads: Some(1),
-        fakenet_pow_len: Some(3),
-        fakenet_log_difficulty: Some(21),
+        fakenet_pow_len: None,
+        fakenet_log_difficulty: None,
         fakenet_genesis_jam_path: None,
     };
     
