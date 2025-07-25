@@ -846,7 +846,6 @@ async fn main() -> Result<()> {
         allowed_peers_path: None,
         no_default_peers: false,  // 不连接默认节点
         bind: vec![
-            "/ip4/0.0.0.0/tcp/13340".to_string(),
             "/ip4/0.0.0.0/udp/13340/quic-v1".to_string()
         ],
         new_peer_id: false,
