@@ -344,142 +344,160 @@ impl MiningPoolService {
         use nockvm::noun::{D, T};
         use nockvm_macros::tas;
         use nockapp::noun::slab::NounSlab;
-        
-        // 在非fakenet模式下，我们应该从主网获取真实的区块链状态
-        // In non-fakenet mode, we should get the real blockchain state from mainnet
-        
-        // 1. peek [%heavy ~] 获取 heaviest block-id
-        let mut heavy_slab = NounSlab::new();
-        let heavy_path = T(&mut heavy_slab, &[D(tas!(b"heavy")), D(0)]);
-        heavy_slab.set_root(heavy_path);
-        let block_id = {
-            let handle = self.nockchain.read().await.get_handle();
-            match handle.peek(heavy_slab).await {
-                Ok(Some(slab)) => {
-                    // slab.root() 应该是 (unit (unit block-id))
-                    let root = unsafe { slab.root() };
-                    // 解包两层 Some
-                    match root.as_cell() {
-                        Ok(cell1) => {
-                            match cell1.tail().as_cell() {
-                                Ok(cell2) => cell2.head(),
+        use tokio::time::{timeout, Duration};
+        let max_retries = 3;
+        let mut last_err = None;
+        for attempt in 1..=max_retries {
+            info!("[CHAIN_STATE] 第{}次尝试获取主网区块链状态...", attempt);
+            let fut = async {
+                // 1. peek [%heavy ~] 获取 heaviest block-id
+                let mut heavy_slab = NounSlab::new();
+                let heavy_path = T(&mut heavy_slab, &[D(tas!(b"heavy")), D(0)]);
+                heavy_slab.set_root(heavy_path);
+                let block_id = {
+                    let handle = self.nockchain.read().await.get_handle();
+                    match handle.peek(heavy_slab).await {
+                        Ok(Some(slab)) => {
+                            // slab.root() 应该是 (unit (unit block-id))
+                            let root = unsafe { slab.root() };
+                            // 解包两层 Some
+                            match root.as_cell() {
+                                Ok(cell1) => {
+                                    match cell1.tail().as_cell() {
+                                        Ok(cell2) => cell2.head(),
+                                        Err(e) => {
+                                            warn!("获取heaviest block-id失败: {}，尝试使用环境变量", e);
+                                            return self.fallback_chain_state().await;
+                                        }
+                                    }
+                                },
                                 Err(e) => {
                                     warn!("获取heaviest block-id失败: {}，尝试使用环境变量", e);
                                     return self.fallback_chain_state().await;
                                 }
                             }
                         },
-                        Err(e) => {
-                            warn!("获取heaviest block-id失败: {}，尝试使用环境变量", e);
+                        _ => {
+                            warn!("无法获取heaviest block-id，尝试使用环境变量");
                             return self.fallback_chain_state().await;
                         }
                     }
-                },
-                _ => {
-                    warn!("无法获取heaviest block-id，尝试使用环境变量");
-                    return self.fallback_chain_state().await;
-                }
-            }
-        };
-        
-        info!("成功获取到主网最新区块ID");
-        
-        // 2. peek [%block <block-id> ~] 获取 page
-        let mut block_slab = NounSlab::new();
-        let block_path = T(&mut block_slab, &[D(tas!(b"block")), block_id, D(0)]);
-        block_slab.set_root(block_path);
-        let handle = self.nockchain.read().await.get_handle();
-        let res = handle.peek(block_slab).await.map_err(|e| anyhow::anyhow!("peek block failed: {e}"))?;
-        let Some(slab) = res else { 
-            warn!("无法获取区块页面，尝试使用环境变量");
-            return self.fallback_chain_state().await; 
-        };
-        let root = unsafe { slab.root() };
-        
-        // 解析区块页面结构
-        // 区块页面结构通常包含更多信息，我们需要提取:
-        // 1. 区块高度 (height)
-        // 2. 目标难度 (target)
-        // 3. 父区块哈希 (parent_hash)
-        let page_cell = match root.as_cell() {
-            Ok(cell) => cell,
-            Err(e) => {
-                warn!("无法解析区块页面: {e}，尝试使用环境变量");
-                return self.fallback_chain_state().await;
-            }
-        };
-        
-        // 获取区块高度
-        let height_noun = page_cell.head();
-        let block_height = height_noun.as_atom().and_then(|a| a.as_u64()).unwrap_or(0);
-        info!("主网当前区块高度: {}", block_height);
-        
-        // 获取区块内容
-        let content_cell = match page_cell.tail().as_cell() {
-            Ok(cell) => cell,
-            Err(e) => {
-                warn!("无法获取区块内容: {e}，尝试使用环境变量");
-                return self.fallback_chain_state().await;
-            }
-        };
-        
-        // 获取目标难度
-        let target_noun = content_cell.head();
-        let target_atom = match target_noun.as_atom() {
-            Ok(atom) => atom,
-            Err(e) => {
-                warn!("无法获取目标难度: {e}，尝试使用环境变量");
-                return self.fallback_chain_state().await;
-            }
-        };
-        let target_bytes = target_atom.to_ne_bytes();
-        info!("成功获取到主网目标难度");
-        
-        // 获取父区块哈希
-        let mut parent_hash_bytes = vec![0; 32]; // 默认值
-        
-        // 尝试获取父区块ID
-        if let Ok(parent_cell) = content_cell.tail().as_cell() {
-            if let Ok(parent_id_noun) = parent_cell.head().as_atom() {
-                // 将父区块ID转换为哈希值
-                parent_hash_bytes = parent_id_noun.to_ne_bytes();
-                // 如果哈希不足32字节，填充到32字节
-                if parent_hash_bytes.len() < 32 {
-                    let mut padded = vec![0; 32];
-                    padded[32 - parent_hash_bytes.len()..].copy_from_slice(&parent_hash_bytes);
-                    parent_hash_bytes = padded;
-                } else if parent_hash_bytes.len() > 32 {
-                    // 如果哈希超过32字节，截取前32字节
-                    parent_hash_bytes = parent_hash_bytes[0..32].to_vec();
-                }
-                info!("成功获取到父区块哈希");
-            }
-        }
-        
-        // 尝试获取交易列表并计算默克尔根
-        let mut merkle_root_bytes = vec![0; 32]; // 默认值
-        
-        // 尝试获取交易列表
-        if let Ok(txs_cell) = content_cell.tail().as_cell() {
-            if let Ok(txs_list) = txs_cell.tail().as_cell() {
-                // 这里应该遍历交易列表并计算默克尔根
-                // 但由于结构可能很复杂，我们简化为使用区块ID的哈希作为默克尔根
-                let block_id_atom = block_id.as_atom().unwrap_or_else(|_| Atom::from_value(&mut NounSlab::<nockapp::noun::slab::NockJammer>::new(), 0).unwrap());
-                let block_id_bytes = block_id_atom.to_ne_bytes();
+                };
+                info!("成功获取到主网最新区块ID");
+                // 2. peek [%block <block-id> ~] 获取 page
+                let mut block_slab = NounSlab::new();
+                let block_path = T(&mut block_slab, &[D(tas!(b"block")), block_id, D(0)]);
+                block_slab.set_root(block_path);
+                let handle = self.nockchain.read().await.get_handle();
+                let res = handle.peek(block_slab).await.map_err(|e| anyhow::anyhow!("peek block failed: {e}"))?;
+                let Some(slab) = res else { 
+                    warn!("无法获取区块页面，尝试使用环境变量");
+                    return self.fallback_chain_state().await; 
+                };
+                let root = unsafe { slab.root() };
                 
-                // 使用blake3计算哈希作为默克尔根
-                let hash = blake3::hash(&block_id_bytes);
-                merkle_root_bytes = hash.as_bytes().to_vec();
-                info!("成功计算默克尔根");
+                // 解析区块页面结构
+                // 区块页面结构通常包含更多信息，我们需要提取:
+                // 1. 区块高度 (height)
+                // 2. 目标难度 (target)
+                // 3. 父区块哈希 (parent_hash)
+                let page_cell = match root.as_cell() {
+                    Ok(cell) => cell,
+                    Err(e) => {
+                        warn!("无法解析区块页面: {e}，尝试使用环境变量");
+                        return self.fallback_chain_state().await;
+                    }
+                };
+                
+                // 获取区块高度
+                let height_noun = page_cell.head();
+                let block_height = height_noun.as_atom().and_then(|a| a.as_u64()).unwrap_or(0);
+                info!("主网当前区块高度: {}", block_height);
+                
+                // 获取区块内容
+                let content_cell = match page_cell.tail().as_cell() {
+                    Ok(cell) => cell,
+                    Err(e) => {
+                        warn!("无法获取区块内容: {e}，尝试使用环境变量");
+                        return self.fallback_chain_state().await;
+                    }
+                };
+                
+                // 获取目标难度
+                let target_noun = content_cell.head();
+                let target_atom = match target_noun.as_atom() {
+                    Ok(atom) => atom,
+                    Err(e) => {
+                        warn!("无法获取目标难度: {e}，尝试使用环境变量");
+                        return self.fallback_chain_state().await;
+                    }
+                };
+                let target_bytes = target_atom.to_ne_bytes();
+                info!("成功获取到主网目标难度");
+                
+                // 获取父区块哈希
+                let mut parent_hash_bytes = vec![0; 32]; // 默认值
+                
+                // 尝试获取父区块ID
+                if let Ok(parent_cell) = content_cell.tail().as_cell() {
+                    if let Ok(parent_id_noun) = parent_cell.head().as_atom() {
+                        // 将父区块ID转换为哈希值
+                        parent_hash_bytes = parent_id_noun.to_ne_bytes();
+                        // 如果哈希不足32字节，填充到32字节
+                        if parent_hash_bytes.len() < 32 {
+                            let mut padded = vec![0; 32];
+                            padded[32 - parent_hash_bytes.len()..].copy_from_slice(&parent_hash_bytes);
+                            parent_hash_bytes = padded;
+                        } else if parent_hash_bytes.len() > 32 {
+                            // 如果哈希超过32字节，截取前32字节
+                            parent_hash_bytes = parent_hash_bytes[0..32].to_vec();
+                        }
+                        info!("成功获取到父区块哈希");
+                    }
+                }
+                
+                // 尝试获取交易列表并计算默克尔根
+                let mut merkle_root_bytes = vec![0; 32]; // 默认值
+                
+                // 尝试获取交易列表
+                if let Ok(txs_cell) = content_cell.tail().as_cell() {
+                    if let Ok(txs_list) = txs_cell.tail().as_cell() {
+                        // 这里应该遍历交易列表并计算默克尔根
+                        // 但由于结构可能很复杂，我们简化为使用区块ID的哈希作为默克尔根
+                        let block_id_atom = block_id.as_atom().unwrap_or_else(|_| Atom::from_value(&mut NounSlab::<nockapp::noun::slab::NockJammer>::new(), 0).unwrap());
+                        let block_id_bytes = block_id_atom.to_ne_bytes();
+                        
+                        // 使用blake3计算哈希作为默克尔根
+                        let hash = blake3::hash(&block_id_bytes);
+                        merkle_root_bytes = hash.as_bytes().to_vec();
+                        info!("成功计算默克尔根");
+                    }
+                }
+                
+                // 更新状态监控器
+                self.status_monitor.update_block_height(block_height).await;
+                
+                info!("成功从主网获取完整的区块链状态");
+                // 返回完整的区块链状态
+                Ok((parent_hash_bytes, merkle_root_bytes, target_bytes))
+            };
+            match timeout(Duration::from_secs(25), fut).await {
+                Ok(Ok(res)) => {
+                    info!("[CHAIN_STATE] 第{}次尝试成功", attempt);
+                    return Ok(res);
+                },
+                Ok(Err(e)) => {
+                    warn!("[CHAIN_STATE] 第{}次尝试失败: {}", attempt, e);
+                    last_err = Some(e);
+                },
+                Err(_) => {
+                    warn!("[CHAIN_STATE] 第{}次尝试超时(15秒)", attempt);
+                    last_err = Some(anyhow::anyhow!("timeout"));
+                }
             }
         }
-        
-        // 更新状态监控器
-        self.status_monitor.update_block_height(block_height).await;
-        
-        info!("成功从主网获取完整的区块链状态");
-        // 返回完整的区块链状态
-        Ok((parent_hash_bytes, merkle_root_bytes, target_bytes))
+        error!("[CHAIN_STATE] 所有尝试均失败");
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("未知错误")))
     }
     
     // 添加一个回退方法，在无法从主网获取状态时使用
@@ -705,20 +723,16 @@ impl MiningPoolService {
 
     // 添加一个初始同步方法，用于服务启动时
     async fn initial_sync_with_mainnet(&self) -> bool {
-        info!("开始尝试初始同步主网数据...");
-        
+        info!("[SYNC] 开始尝试初始同步主网数据...");
         // 1. 检查是否已经设置了创世区块
         let genesis_seal_set = {
             use nockvm::noun::{D, T};
-            // 删除这里未使用的导入
-            // use nockvm_macros::tas;
             use nockapp::noun::slab::NounSlab;
-            
+            info!("[SYNC] 检查是否已设置创世区块...");
             let mut peek_slab = NounSlab::new();
             let tag = make_tas(&mut peek_slab, "genesis-seal-set").as_noun();
             let peek_noun = T(&mut peek_slab, &[tag, D(0)]);
             peek_slab.set_root(peek_noun);
-            
             let handle = self.nockchain.read().await.get_handle();
             match handle.peek(peek_slab).await {
                 Ok(Some(slab)) => {
@@ -732,27 +746,32 @@ impl MiningPoolService {
                 _ => false
             }
         };
-        
+        info!("[SYNC] 创世区块已设置: {}", genesis_seal_set);
         if genesis_seal_set {
-            info!("创世区块已设置，检查是否为主网创世区块");
+            info!("[SYNC] 创世区块已设置，检查是否为主网创世区块");
         } else {
-            warn!("未检测到创世区块设置，将尝试设置主网创世区块");
-            // 尝试设置主网创世区块
+            warn!("[SYNC] 未检测到创世区块设置，将尝试设置主网创世区块");
             match self.set_realnet_genesis_seal().await {
-                Ok(true) => info!("成功设置主网创世区块"),
-                Ok(false) => warn!("设置主网创世区块失败"),
-                Err(e) => error!("设置主网创世区块时发生错误: {}", e),
+                Ok(true) => info!("[SYNC] 成功设置主网创世区块"),
+                Ok(false) => warn!("[SYNC] 设置主网创世区块失败"),
+                Err(e) => error!("[SYNC] 设置主网创世区块时发生错误: {}", e),
             }
         }
-        
         // 2. 尝试获取区块链状态
-        match self.get_chain_state().await {
-            Ok((_, _, _)) => {
-                info!("成功获取主网区块链状态");
+        info!("[SYNC] 尝试获取主网区块链状态（带超时保护）...");
+        use tokio::time::{timeout, Duration};
+        let chain_state_result = timeout(Duration::from_secs(77), self.get_chain_state()).await;
+        match chain_state_result {
+            Ok(Ok((_, _, _))) => {
+                info!("[SYNC] 成功获取主网区块链状态");
                 true
             },
-            Err(e) => {
-                error!("获取主网区块链状态失败: {}", e);
+            Ok(Err(e)) => {
+                error!("[SYNC] 获取主网区块链状态失败: {}", e);
+                false
+            },
+            Err(_) => {
+                error!("[SYNC] 获取主网区块链状态超时（77秒）");
                 false
             }
         }
@@ -1304,6 +1323,7 @@ async fn main() -> Result<()> {
     
     // 启动gRPC服务器
     let addr = pool_server_address.parse()?;
+    info!("准备启动gRPC服务器监听于 {}", pool_server_address);
     info!("矿池服务器监听于 {}", addr);
     
     Server::builder()
