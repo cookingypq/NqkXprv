@@ -18,7 +18,7 @@ use crate::status_monitor::StatusMonitor;
 // 引入nockchain核心库，用于集成nockchain节点
 use kernels::dumb::KERNEL;
 use nockapp::kernel::boot;
-// 移除未使用的导入
+use nockapp::utils::make_tas;
 use nockapp::nockapp::driver::{NockAppHandle, PokeResult};
 use nockapp::nockapp::wire::Wire;
 use nockapp::NockApp;
@@ -206,7 +206,31 @@ impl MiningPoolService {
             info!("开始监听区块链事件 | Started listening for blockchain events");
             
             // 持续监听区块链事件
-            while let Ok(_effect) = effect_receiver.recv().await {
+            while let Ok(effect) = effect_receiver.recv().await {
+                // 检查effect是否与区块相关
+                let is_block_effect = unsafe {
+                    let root = effect.root();
+                    if let Ok(cell) = root.as_cell() {
+                        if let Ok(head) = cell.head().as_atom() {
+                            let bytes = head.to_ne_bytes();
+                            if bytes.len() >= 4 {
+                                let tag_str = String::from_utf8_lossy(&bytes[0..4]);
+                                tag_str == "fact" || tag_str == "bloc"
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+
+                if is_block_effect {
+                    info!("接收到区块相关事件，检查是否需要更新工作任务");
+                }
+                
                 // 当收到任何effect时，我们检查当前链状态是否有更新
                 // 使用peek [%heavy ~] 来获取当前最新区块
                 let current_block_id = match service_clone.get_current_block_id().await {
@@ -317,16 +341,12 @@ impl MiningPoolService {
     
     // 从nockchain节点获取区块链状态 | Get blockchain state from nockchain node
     async fn get_chain_state(&self) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-        // 优先读取 DIFFICULTY_TARGET 环境变量
-        if let Ok(diff_hex) = std::env::var("DIFFICULTY_TARGET") {
-            if let Ok(bytes) = hex::decode(&diff_hex) {
-                // parent_hash/merkle_root 仍用空
-                return Ok((vec![0;32], vec![0;32], bytes));
-            }
-        }
         use nockvm::noun::{D, T};
         use nockvm_macros::tas;
         use nockapp::noun::slab::NounSlab;
+        
+        // 在非fakenet模式下，我们应该从主网获取真实的区块链状态
+        // In non-fakenet mode, we should get the real blockchain state from mainnet
         
         // 1. peek [%heavy ~] 获取 heaviest block-id
         let mut heavy_slab = NounSlab::new();
@@ -334,16 +354,35 @@ impl MiningPoolService {
         heavy_slab.set_root(heavy_path);
         let block_id = {
             let handle = self.nockchain.read().await.get_handle();
-            let res = handle.peek(heavy_slab).await.map_err(|e| anyhow::anyhow!("peek heavy failed: {e}"))?;
-            let Some(slab) = res else { return Err(anyhow::anyhow!("no heavy block returned")); };
-            // slab.root() 应该是 (unit (unit block-id))
-            let root = unsafe { slab.root() };
-            // 解包两层 Some
-            let cell1 = root.as_cell().map_err(|_| anyhow::anyhow!("heavy: not cell1"))?;
-            let cell2 = cell1.tail().as_cell().map_err(|_| anyhow::anyhow!("heavy: not cell2"))?;
-            let block_id_noun = cell2.head();
-            block_id_noun
+            match handle.peek(heavy_slab).await {
+                Ok(Some(slab)) => {
+                    // slab.root() 应该是 (unit (unit block-id))
+                    let root = unsafe { slab.root() };
+                    // 解包两层 Some
+                    match root.as_cell() {
+                        Ok(cell1) => {
+                            match cell1.tail().as_cell() {
+                                Ok(cell2) => cell2.head(),
+                                Err(e) => {
+                                    warn!("获取heaviest block-id失败: {}，尝试使用环境变量", e);
+                                    return self.fallback_chain_state().await;
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            warn!("获取heaviest block-id失败: {}，尝试使用环境变量", e);
+                            return self.fallback_chain_state().await;
+                        }
+                    }
+                },
+                _ => {
+                    warn!("无法获取heaviest block-id，尝试使用环境变量");
+                    return self.fallback_chain_state().await;
+                }
+            }
         };
+        
+        info!("成功获取到主网最新区块ID");
         
         // 2. peek [%block <block-id> ~] 获取 page
         let mut block_slab = NounSlab::new();
@@ -351,7 +390,10 @@ impl MiningPoolService {
         block_slab.set_root(block_path);
         let handle = self.nockchain.read().await.get_handle();
         let res = handle.peek(block_slab).await.map_err(|e| anyhow::anyhow!("peek block failed: {e}"))?;
-        let Some(slab) = res else { return Err(anyhow::anyhow!("no block page returned")); };
+        let Some(slab) = res else { 
+            warn!("无法获取区块页面，尝试使用环境变量");
+            return self.fallback_chain_state().await; 
+        };
         let root = unsafe { slab.root() };
         
         // 解析区块页面结构
@@ -359,19 +401,39 @@ impl MiningPoolService {
         // 1. 区块高度 (height)
         // 2. 目标难度 (target)
         // 3. 父区块哈希 (parent_hash)
-        let page_cell = root.as_cell().map_err(|_| anyhow::anyhow!("block page: not cell"))?;
+        let page_cell = match root.as_cell() {
+            Ok(cell) => cell,
+            Err(e) => {
+                warn!("无法解析区块页面: {e}，尝试使用环境变量");
+                return self.fallback_chain_state().await;
+            }
+        };
         
         // 获取区块高度
         let height_noun = page_cell.head();
         let block_height = height_noun.as_atom().and_then(|a| a.as_u64()).unwrap_or(0);
+        info!("主网当前区块高度: {}", block_height);
         
         // 获取区块内容
-        let content_cell = page_cell.tail().as_cell().map_err(|_| anyhow::anyhow!("block page: content not cell"))?;
+        let content_cell = match page_cell.tail().as_cell() {
+            Ok(cell) => cell,
+            Err(e) => {
+                warn!("无法获取区块内容: {e}，尝试使用环境变量");
+                return self.fallback_chain_state().await;
+            }
+        };
         
         // 获取目标难度
         let target_noun = content_cell.head();
-        let target_atom = target_noun.as_atom().map_err(|e| anyhow::anyhow!("block page: target_noun 不是 atom: {}", e))?;
+        let target_atom = match target_noun.as_atom() {
+            Ok(atom) => atom,
+            Err(e) => {
+                warn!("无法获取目标难度: {e}，尝试使用环境变量");
+                return self.fallback_chain_state().await;
+            }
+        };
         let target_bytes = target_atom.to_ne_bytes();
+        info!("成功获取到主网目标难度");
         
         // 获取父区块哈希
         let mut parent_hash_bytes = vec![0; 32]; // 默认值
@@ -390,6 +452,7 @@ impl MiningPoolService {
                     // 如果哈希超过32字节，截取前32字节
                     parent_hash_bytes = parent_hash_bytes[0..32].to_vec();
                 }
+                info!("成功获取到父区块哈希");
             }
         }
         
@@ -407,14 +470,31 @@ impl MiningPoolService {
                 // 使用blake3计算哈希作为默克尔根
                 let hash = blake3::hash(&block_id_bytes);
                 merkle_root_bytes = hash.as_bytes().to_vec();
+                info!("成功计算默克尔根");
             }
         }
         
         // 更新状态监控器
         self.status_monitor.update_block_height(block_height).await;
         
+        info!("成功从主网获取完整的区块链状态");
         // 返回完整的区块链状态
         Ok((parent_hash_bytes, merkle_root_bytes, target_bytes))
+    }
+    
+    // 添加一个回退方法，在无法从主网获取状态时使用
+    async fn fallback_chain_state(&self) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        // 尝试读取 DIFFICULTY_TARGET 环境变量
+        if let Ok(diff_hex) = std::env::var("DIFFICULTY_TARGET") {
+            if let Ok(bytes) = hex::decode(&diff_hex) {
+                warn!("使用环境变量中的难度目标作为回退");
+                // parent_hash/merkle_root 仍用空
+                return Ok((vec![0;32], vec![0;32], bytes));
+            }
+        }
+        
+        // 如果环境变量不可用，返回错误
+        Err(anyhow::anyhow!("无法获取主网状态，环境变量DIFFICULTY_TARGET也未设置"))
     }
     
     // 将成功的区块提交到nockchain节点 | Submit successful block to nockchain node
@@ -424,8 +504,13 @@ impl MiningPoolService {
         let current_work = self.current_work.read().await;
         let work = match &*current_work {
             Some(work) => work,
-            None => return Ok(false),
+            None => {
+                warn!("提交区块失败：没有当前工作任务上下文");
+                return Ok(false)
+            },
         };
+        
+        info!("准备提交区块到主网，nonce: {}", hex::encode(&work_result.nonce));
         
         // 创建区块提交的poke
         // Create poke for block submission
@@ -445,6 +530,12 @@ impl MiningPoolService {
             
         let submit_block = Atom::from_value(&mut submit_slab, "submit-block")
             .expect("Failed to create submit-block atom");
+        
+        info!("区块数据准备完成 - parent_hash: {}, merkle_root: {}, timestamp: {}, nonce: {}",
+              hex::encode(&work.parent_hash),
+              hex::encode(&work.merkle_root),
+              work.timestamp,
+              hex::encode(&work_result.nonce));
             
         // 构建区块提交poke [command %submit-block parent_hash merkle_root timestamp nonce]
         // Build block submission poke [command %submit-block parent_hash merkle_root timestamp nonce]
@@ -462,19 +553,37 @@ impl MiningPoolService {
         
         submit_slab.set_root(submit_poke);
         
+        info!("发送区块提交请求到nockchain节点");
+        
         // 发送区块提交poke，使用线程安全的方式
         // Send block submission poke, using thread-safe method
-        let response = self.handle.safe_poke(MiningWire::SetPubKey.to_wire(), submit_slab).await?;
+        let response = match self.handle.safe_poke(MiningWire::SetPubKey.to_wire(), submit_slab).await {
+            Ok(res) => res,
+            Err(e) => {
+                error!("提交区块时发生错误: {}", e);
+                return Ok(false);
+            }
+        };
         
         // 验证响应
         // Validate response
         match response {
             PokeResult::Ack => {
+                info!("区块已被nockchain节点接受！");
                 // 更新状态监控 - 区块已接受
                 self.status_monitor.increment_blocks_accepted();
+                
+                // 生成新的工作任务
+                info!("区块已接受，生成新的工作任务");
+                let new_work = self.generate_work().await;
+                self.broadcast_work(new_work).await;
+                
                 Ok(true)
             },
-            PokeResult::Nack => Ok(false),
+            PokeResult::Nack => {
+                warn!("区块被nockchain节点拒绝");
+                Ok(false)
+            },
         }
     }
 
@@ -486,18 +595,58 @@ impl MiningPoolService {
         heavy_slab.set_root(heavy_path);
         
         let handle = self.nockchain.read().await.get_handle();
-        let res = handle.peek(heavy_slab).await.map_err(|e| anyhow::anyhow!("peek heavy failed: {e}"))?;
-        let Some(slab) = res else { return Err(anyhow::anyhow!("no heavy block returned")); };
+        let res = match handle.peek(heavy_slab).await {
+            Ok(res) => res,
+            Err(e) => {
+                warn!("获取最新区块ID失败: {}", e);
+                return Err(anyhow::anyhow!("peek heavy failed: {}", e));
+            }
+        };
         
-        // 解析返回的区块ID
+        let slab = match res {
+            Some(slab) => slab,
+            None => {
+                warn!("获取最新区块ID返回空结果");
+                return Err(anyhow::anyhow!("no heavy block returned"));
+            }
+        };
+        
+        // 解析结果
         let root = unsafe { slab.root() };
-        let cell1 = root.as_cell().map_err(|_| anyhow::anyhow!("heavy: not cell1"))?;
-        let cell2 = cell1.tail().as_cell().map_err(|_| anyhow::anyhow!("heavy: not cell2"))?;
+        
+        // 解包两层 Some 以获取block_id
+        let cell1 = match root.as_cell() {
+            Ok(cell) => cell,
+            Err(e) => {
+                warn!("解析heavy结果失败 - 不是cell: {}", e);
+                return Err(anyhow::anyhow!("heavy result is not a cell: {}", e));
+            }
+        };
+        
+        let cell2 = match cell1.tail().as_cell() {
+            Ok(cell) => cell,
+            Err(e) => {
+                warn!("解析heavy结果失败 - tail不是cell: {}", e);
+                return Err(anyhow::anyhow!("heavy tail is not a cell: {}", e));
+            }
+        };
+        
         let block_id_noun = cell2.head();
         
-        // 将区块ID转换为字节
-        let block_id_atom = block_id_noun.as_atom().map_err(|_| anyhow::anyhow!("block_id not atom"))?;
+        // 将block_id转换为bytes
+        let block_id_atom = match block_id_noun.as_atom() {
+            Ok(atom) => atom,
+            Err(e) => {
+                warn!("block_id不是atom: {}", e);
+                return Err(anyhow::anyhow!("block_id is not an atom: {}", e));
+            }
+        };
+        
         let block_id_bytes = block_id_atom.to_ne_bytes();
+        
+        // 记录获取到的区块ID（截取前几个字节）
+        let display_len = std::cmp::min(8, block_id_bytes.len());
+        info!("获取到当前最新区块ID: {}...", hex::encode(&block_id_bytes[0..display_len]));
         
         Ok(block_id_bytes)
     }
@@ -552,6 +701,172 @@ impl MiningPoolService {
             },
             status_monitor: self.status_monitor.clone(),
         }
+    }
+
+    // 添加一个初始同步方法，用于服务启动时
+    async fn initial_sync_with_mainnet(&self) -> bool {
+        info!("开始尝试初始同步主网数据...");
+        
+        // 1. 检查是否已经设置了创世区块
+        let genesis_seal_set = {
+            use nockvm::noun::{D, T};
+            // 删除这里未使用的导入
+            // use nockvm_macros::tas;
+            use nockapp::noun::slab::NounSlab;
+            
+            let mut peek_slab = NounSlab::new();
+            let tag = make_tas(&mut peek_slab, "genesis-seal-set").as_noun();
+            let peek_noun = T(&mut peek_slab, &[tag, D(0)]);
+            peek_slab.set_root(peek_noun);
+            
+            let handle = self.nockchain.read().await.get_handle();
+            match handle.peek(peek_slab).await {
+                Ok(Some(slab)) => {
+                    let genesis_seal = unsafe { slab.root() };
+                    if genesis_seal.is_atom() {
+                        unsafe { genesis_seal.raw_equals(&nockvm::noun::YES) }
+                    } else {
+                        false
+                    }
+                },
+                _ => false
+            }
+        };
+        
+        if genesis_seal_set {
+            info!("创世区块已设置，检查是否为主网创世区块");
+        } else {
+            warn!("未检测到创世区块设置，将尝试设置主网创世区块");
+            // 尝试设置主网创世区块
+            match self.set_realnet_genesis_seal().await {
+                Ok(true) => info!("成功设置主网创世区块"),
+                Ok(false) => warn!("设置主网创世区块失败"),
+                Err(e) => error!("设置主网创世区块时发生错误: {}", e),
+            }
+        }
+        
+        // 2. 尝试获取区块链状态
+        match self.get_chain_state().await {
+            Ok((_, _, _)) => {
+                info!("成功获取主网区块链状态");
+                true
+            },
+            Err(e) => {
+                error!("获取主网区块链状态失败: {}", e);
+                false
+            }
+        }
+    }
+    
+    // 设置主网创世区块的辅助方法
+    async fn set_realnet_genesis_seal(&self) -> Result<bool, anyhow::Error> {
+        use nockvm::noun::{D, T};
+        // 删除未使用的导入
+        // use nockvm_macros::tas;
+        use nockapp::noun::slab::NounSlab;
+        use nockapp::ToBytes;
+        
+        info!("尝试设置主网创世区块...");
+        
+        let mut poke_slab = NounSlab::new();
+        let block_height_noun = Atom::new(&mut poke_slab, nockchain::setup::DEFAULT_GENESIS_BLOCK_HEIGHT).as_noun();
+        
+        let seal_message = nockchain::setup::REALNET_GENESIS_MESSAGE.to_string();
+        let seal_byts = Bytes::from(
+            seal_message.to_bytes()
+                .map_err(|_| anyhow::anyhow!("Failed to convert seal message to bytes"))?
+        );
+        let seal_noun = Atom::from_bytes(&mut poke_slab, &seal_byts).as_noun();
+        
+        let tag = Bytes::from(b"set-genesis-seal".to_vec());
+        let set_genesis_seal = Atom::from_bytes(&mut poke_slab, &tag).as_noun();
+        
+        let poke_noun = T(
+            &mut poke_slab,
+            &[D(tas!(b"command")), set_genesis_seal, block_height_noun, seal_noun],
+        );
+        poke_slab.set_root(poke_noun);
+        
+        // 发送poke
+        let handle = self.nockchain.read().await.get_handle();
+        match handle.poke(nockapp::wire::SystemWire.to_wire(), poke_slab).await {
+            Ok(PokeResult::Ack) => {
+                info!("主网创世区块设置成功");
+                Ok(true)
+            },
+            Ok(PokeResult::Nack) => {
+                warn!("主网创世区块设置被拒绝");
+                Ok(false)
+            },
+            Err(e) => {
+                error!("设置主网创世区块时出错: {}", e);
+                Err(anyhow::anyhow!("设置主网创世区块时出错: {}", e))
+            }
+        }
+    }
+    
+    // 验证当前系统是否正确使用了主网创世区块
+    async fn verify_mainnet_genesis(&self) -> Result<bool, anyhow::Error> {
+        use nockvm::noun::{D, T};
+        // 删除未使用的导入
+        // use nockvm_macros::tas;
+        use nockapp::noun::slab::NounSlab;
+        
+        // 检查是否设置了创世区块
+        let mut peek_slab = NounSlab::new();
+        let tag = make_tas(&mut peek_slab, "genesis-seal-set").as_noun();
+        let peek_noun = T(&mut peek_slab, &[tag, D(0)]);
+        peek_slab.set_root(peek_noun);
+        
+        let handle = self.nockchain.read().await.get_handle();
+        let genesis_seal_set = match handle.peek(peek_slab).await {
+            Ok(Some(slab)) => {
+                let genesis_seal = unsafe { slab.root() };
+                if genesis_seal.is_atom() {
+                    unsafe { genesis_seal.raw_equals(&nockvm::noun::YES) }
+                } else {
+                    false
+                }
+            },
+            _ => false
+        };
+        
+        if !genesis_seal_set {
+            warn!("未检测到设置的创世区块，将尝试设置主网创世区块");
+            return self.set_realnet_genesis_seal().await;
+        }
+        
+        // 检查当前设置的创世区块信息是否是主网创世区块
+        let mut peek_slab = NounSlab::new();
+        let tag = make_tas(&mut peek_slab, "genesis-seal").as_noun();
+        let peek_noun = T(&mut peek_slab, &[tag, D(0)]);
+        peek_slab.set_root(peek_noun);
+        
+        let handle = self.nockchain.read().await.get_handle();
+        match handle.peek(peek_slab).await {
+            Ok(Some(slab)) => {
+                let genesis_seal = unsafe { slab.root() };
+                if let Ok(atom) = genesis_seal.as_atom() {
+                    let bytes = atom.to_ne_bytes();
+                    let seal_text = String::from_utf8_lossy(&bytes).to_string();
+                    
+                    // 检查是否与主网创世信息匹配
+                    if seal_text.contains(&nockchain::setup::REALNET_GENESIS_MESSAGE) {
+                        info!("验证主网创世区块：正确使用了主网创世区块");
+                        return Ok(true);
+                    } else {
+                        warn!("验证主网创世区块：当前使用的不是主网创世区块");
+                        // 尝试修复
+                        return self.set_realnet_genesis_seal().await;
+                    }
+                }
+            },
+            _ => {
+                warn!("无法检索创世区块信息");
+            }
+        }
+        
+        Ok(false)
     }
 }
 
@@ -830,22 +1145,22 @@ async fn main() -> Result<()> {
     // 初始化nockchain节点
     info!("初始化内嵌nockchain节点...");
     
-    // 创建配置，使用nockchain原生日志系统
-    let nockapp_cli = boot::default_boot_cli(true);
-    
-    // 创建nockchain配置
+    // 创建一个nockchain cli配置，用于初始化节点
+    // Create a nockchain cli config to initialize the node
     let nockchain_cli = nockchain::config::NockchainCli {
-        nockapp_cli: nockapp_cli,
+        nockapp_cli: boot::default_boot_cli(true),
         npc_socket: ".socket/nockchain_npc.sock".to_string(),
         mine: false,
         mining_pubkey: Some(mining_pubkey.clone()),
         mining_key_adv: None,
-        fakenet: true,  // 使用fakenet模式来简化测试
-        peer: vec![],
+        fakenet: false,  // 确保fakenet设置为false以连接到主网
+        peer: vec!["/ip4/121.61.204.239/udp/3006/quic-v1/p2p/12D3KooWEjQcZUS3x5YEMuMj1kgZJyoV4MTHNRnbtbSEMAMzwGQC".to_string()],
         force_peer: vec![],
         allowed_peers_path: None,
-        no_default_peers: true,  // 不连接默认节点
-        bind: vec![],
+        no_default_peers: false,  // 确保连接到默认节点
+        bind: vec![
+            "/ip4/0.0.0.0/udp/13340/quic-v1".to_string()
+        ],
         new_peer_id: false,
         max_established_incoming: None,
         max_established_outgoing: None,
@@ -857,10 +1172,14 @@ async fn main() -> Result<()> {
         max_system_memory_fraction: None,
         max_system_memory_bytes: None,
         num_threads: Some(1),
-        fakenet_pow_len: Some(3),
-        fakenet_log_difficulty: Some(21),
+        fakenet_pow_len: None,
+        fakenet_log_difficulty: None,
         fakenet_genesis_jam_path: None,
     };
+    
+    // 记录我们正在使用的配置
+    info!("当前网络模式: {}", if nockchain_cli.fakenet { "fakenet" } else { "主网" });
+    info!("将使用的创世信息: {}", nockchain::setup::REALNET_GENESIS_MESSAGE);
     
     // 使用修改后的启动方式
     // Use modified boot method
@@ -887,6 +1206,14 @@ async fn main() -> Result<()> {
     // 获取对状态监控器的引用，用于HTTP API
     let status_monitor = service.status_monitor.clone();
     
+    // 执行初始同步，尝试与主网同步创世区块信息
+    info!("执行初始主网同步...");
+    if service.initial_sync_with_mainnet().await {
+        info!("与主网同步成功，可以正常开始挖矿操作");
+    } else {
+        warn!("与主网同步失败，将尝试使用本地设置继续运行");
+    }
+    
     // 生成初始工作任务
     let initial_work = service.generate_work().await;
     service.broadcast_work(initial_work).await;
@@ -895,27 +1222,75 @@ async fn main() -> Result<()> {
     // 这是一个额外的保障机制，防止事件监听器错过某些更新
     let service_clone = Arc::new(service.clone());
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
+        // 主网模式下，更频繁地检查状态以确保及时同步
+        let interval_seconds = 10;
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_seconds));
+        
+        info!("启动定期区块链状态检查任务，间隔 {} 秒", interval_seconds);
+        
+        let mut last_check_time = std::time::Instant::now();
+        let mut last_block_id: Option<Vec<u8>> = None;
+        
         loop {
             interval.tick().await;
-            info!("执行定期区块链状态检查 | Performing periodic blockchain state check");
+            
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(last_check_time).as_secs();
+            
+            info!("执行定期区块链状态检查 | Performing periodic blockchain state check ({}秒后)", elapsed);
+            last_check_time = now;
             
             // 获取当前区块ID
-            match service_clone.get_current_block_id().await {
-                Ok(current_block_id) => {
-                    // 检查当前工作是否过时
-                    if service_clone.is_work_outdated(&current_block_id).await {
-                        // 如果过时，生成新工作并广播
-                        info!("定期检查发现区块链状态更新，生成新工作 | Periodic check detected blockchain state update, generating new work");
-                        let new_work = service_clone.generate_work().await;
-                        service_clone.broadcast_work(new_work).await;
-                    } else {
-                        info!("定期检查：当前工作仍然有效 | Periodic check: current work is still valid");
-                    }
-                },
+            let current_block_id = match service_clone.get_current_block_id().await {
+                Ok(id) => id,
                 Err(e) => {
                     warn!("定期检查：获取区块ID失败: {} | Periodic check: failed to get block ID: {}", e, e);
+                    continue;
                 }
+            };
+            
+            // 检查区块ID是否发生变化
+            let block_changed = match &last_block_id {
+                Some(last_id) => last_id != &current_block_id,
+                None => true, // 首次运行视为变化
+            };
+            
+            if block_changed {
+                info!("定期检查：检测到新区块");
+                last_block_id = Some(current_block_id.clone());
+            }
+            
+            // 检查当前工作是否过时
+            if block_changed || service_clone.is_work_outdated(&current_block_id).await {
+                // 如果过时，生成新工作并广播
+                info!("定期检查发现区块链状态更新，生成新工作 | Periodic check detected blockchain state update, generating new work");
+                let new_work = service_clone.generate_work().await;
+                service_clone.broadcast_work(new_work).await;
+            } else {
+                info!("定期检查：当前工作仍然有效 | Periodic check: current work is still valid");
+            }
+            
+            // 额外检查系统连接状态
+            let has_miners = !service_clone.miners.is_empty();
+            if has_miners {
+                let count = service_clone.miners.len();
+                info!("定期检查：当前有 {} 个矿工连接", count);
+            } else {
+                info!("定期检查：当前没有矿工连接");
+            }
+            
+            // 每60秒验证一次创世区块信息
+            if now.duration_since(last_check_time).as_secs() >= 60 {
+                tokio::spawn({
+                    let service_clone = service_clone.clone();
+                    async move {
+                        match service_clone.verify_mainnet_genesis().await {
+                            Ok(true) => info!("验证主网创世区块：状态正常"),
+                            Ok(false) => warn!("验证主网创世区块：检测到配置错误，将尝试修复"),
+                            Err(e) => error!("验证主网创世区块时出错: {}", e),
+                        }
+                    }
+                });
             }
         }
     });
