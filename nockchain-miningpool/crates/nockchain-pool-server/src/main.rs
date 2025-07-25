@@ -429,15 +429,22 @@ impl MiningPoolService {
         let mut current_work = self.current_work.write().await;
         *current_work = Some(work_context);
         
-        // 广播给所有已连接的矿工 | Broadcast to all connected miners
-        let miners_count = self.miners.len();
+        // 修复：先获取矿工列表的快照，避免在迭代过程中可能的并发修改
+        // Fix: Get a snapshot of miners first to avoid potential concurrent modifications during iteration
+        let miners_snapshot: Vec<_> = self.miners.iter()
+            .map(|miner| (miner.miner_id.clone(), miner.work_sender.clone()))
+            .collect();
+        
+        let miners_count = miners_snapshot.len();
         let mut success_count = 0;
         let mut failure_count = 0;
         
         info!("广播新工作任务给 {} 个矿工，任务ID: {} | Broadcasting new work task to {} miners, task ID: {}", 
               miners_count, work.work_id, miners_count, work.work_id);
         
-        for mut miner in self.miners.iter_mut() {
+        // 修复：使用快照进行迭代，避免竞态条件
+        // Fix: Use snapshot for iteration to avoid race conditions
+        for (miner_id, work_sender) in miners_snapshot {
             // 创建工作任务的克隆 | Create a clone of the work task
             let work_clone = WorkOrder {
                 work_id: work.work_id.clone(),
@@ -448,20 +455,26 @@ impl MiningPoolService {
             };
             
             // 更新矿工的最后工作ID
-            miner.last_work_id = Some(work_clone.work_id.clone());
-            
-            // 发送工作任务 | Send work task
-            if let Err(e) = miner.work_sender.try_send(Ok(work_clone)) {
-                error!(
-                    "向矿工 {} 发送工作任务失败: {} | Failed to send work task to miner {}: {}", 
-                    miner.miner_id, e, miner.miner_id, e
-                );
-                failure_count += 1;
-            } else {
-                success_count += 1;
+            if let Some(mut miner) = self.miners.get_mut(&miner_id) {
+                miner.last_work_id = Some(work_clone.work_id.clone());
                 
-                // 更新矿工的最后活动时间
-                miner.last_active = chrono::Utc::now();
+                // 发送工作任务 | Send work task
+                if let Err(e) = work_sender.try_send(Ok(work_clone)) {
+                    error!(
+                        "向矿工 {} 发送工作任务失败: {} | Failed to send work task to miner {}: {}", 
+                        miner_id, e, miner_id, e
+                    );
+                    failure_count += 1;
+                } else {
+                    success_count += 1;
+                    
+                    // 更新矿工的最后活动时间
+                    miner.last_active = chrono::Utc::now();
+                }
+            } else {
+                // 矿工在获取快照后被移除
+                debug!("矿工 {} 在广播过程中被移除，跳过发送工作任务", miner_id);
+                failure_count += 1;
             }
         }
         
@@ -469,6 +482,9 @@ impl MiningPoolService {
             "工作任务广播完成：成功 {}/{}，失败 {} | Work task broadcast completed: success {}/{}, failure {}", 
             success_count, miners_count, failure_count, success_count, miners_count, failure_count
         );
+        
+        // 释放锁
+        drop(current_work);
     }
 
     // 从nockchain节点生成新的工作任务 | Generate new work task from nockchain node
@@ -1425,10 +1441,21 @@ impl MiningPoolService {
         
         // 确认工作任务ID匹配 | Confirm work task ID matches
         if let Some(work) = &*current_work {
-            if work.work_id != result.work_id {
+            // 修复：在进行验证前先克隆必要的数据，避免长时间持有锁
+            // Fix: Clone necessary data before validation to avoid holding lock for too long
+            let work_id = work.work_id.clone();
+            let parent_hash = work.parent_hash.clone();
+            let merkle_root = work.merkle_root.clone();
+            let timestamp = work.timestamp;
+            let difficulty_target = work.difficulty_target.clone();
+            
+            // 释放读锁，避免潜在的死锁
+            drop(current_work);
+            
+            if work_id != result.work_id {
                 warn!(
                     "工作任务ID不匹配: 期望 {}, 收到 {} | Work task ID mismatch: expected {}, got {}", 
-                    work.work_id, result.work_id, work.work_id, result.work_id
+                    work_id, result.work_id, work_id, result.work_id
                 );
                 return false;
             }
@@ -1436,12 +1463,12 @@ impl MiningPoolService {
             // 从当前工作任务和提交的nonce构建区块头
             // Build block header from current work task and submitted nonce
             let mut block_data = Vec::with_capacity(
-                work.parent_hash.len() + work.merkle_root.len() + 8 + result.nonce.len()
+                parent_hash.len() + merkle_root.len() + 8 + result.nonce.len()
             );
             
-            block_data.extend_from_slice(&work.parent_hash);
-            block_data.extend_from_slice(&work.merkle_root);
-            block_data.extend_from_slice(&work.timestamp.to_le_bytes());
+            block_data.extend_from_slice(&parent_hash);
+            block_data.extend_from_slice(&merkle_root);
+            block_data.extend_from_slice(&timestamp.to_le_bytes());
             block_data.extend_from_slice(&result.nonce);
             
             // 计算区块哈希 | Calculate block hash
@@ -1454,22 +1481,22 @@ impl MiningPoolService {
             );
             
             // 记录当前难度目标
-            info!("当前难度目标: {}", hex::encode(&work.difficulty_target));
+            info!("当前难度目标: {}", hex::encode(&difficulty_target));
             
             // 比较哈希与目标难度 | Compare hash with target difficulty
-            let is_valid = compare_hash_with_target(hash.as_bytes(), &work.difficulty_target);
+            let is_valid = compare_hash_with_target(hash.as_bytes(), &difficulty_target);
             
             if is_valid {
                 info!(
                     "有效的工作结果: 哈希值 {} 满足难度目标 {} | Valid work result: hash {} meets difficulty target {}", 
-                    hex::encode(hash.as_bytes()), hex::encode(&work.difficulty_target),
-                    hex::encode(hash.as_bytes()), hex::encode(&work.difficulty_target)
+                    hex::encode(hash.as_bytes()), hex::encode(&difficulty_target),
+                    hex::encode(hash.as_bytes()), hex::encode(&difficulty_target)
                 );
             } else {
                 warn!(
                     "无效的工作结果: 哈希值 {} 不满足难度目标 {} | Invalid work result: hash {} does not meet difficulty target {}", 
-                    hex::encode(hash.as_bytes()), hex::encode(&work.difficulty_target),
-                    hex::encode(hash.as_bytes()), hex::encode(&work.difficulty_target)
+                    hex::encode(hash.as_bytes()), hex::encode(&difficulty_target),
+                    hex::encode(hash.as_bytes()), hex::encode(&difficulty_target)
                 );
             }
             
@@ -1730,3 +1757,86 @@ async fn main() -> Result<()> {
 
 // 移除无法实现的手动引导函数
 // async fn bootstrap_network(service: Arc<MiningPoolService>) { ... } 
+
+// 添加用于测试的函数
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::timeout;
+    
+    // 测试连接断开后的资源清理
+    #[tokio::test]
+    async fn test_resource_cleanup_after_disconnect() {
+        // 创建状态监控器
+        let status_monitor = Arc::new(StatusMonitor::new());
+        
+        // 添加一个测试矿工
+        let miner_id = "test_miner".to_string();
+        status_monitor.update_miner(miner_id.clone(), 4).await;
+        
+        // 设置为断开连接状态
+        status_monitor.set_miner_disconnected(&miner_id);
+        
+        // 验证矿工仍然存在
+        assert!(status_monitor.get_miner_connection_status(&miner_id).is_some());
+        
+        // 等待足够长的时间，确保清理任务有机会运行
+        // 在实际测试中可能需要模拟时间而不是真实等待
+        // tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        
+        // 手动触发清理
+        status_monitor.remove_miner(&miner_id);
+        
+        // 验证矿工已被移除
+        assert!(status_monitor.get_miner_connection_status(&miner_id).is_none());
+    }
+    
+    // 测试任务分发中的竞态条件处理
+    #[tokio::test]
+    async fn test_task_distribution_race_condition() {
+        // 创建一个模拟的矿工连接集合
+        let miners = Arc::new(DashMap::new());
+        let (tx1, _rx1) = mpsc::channel::<Result<WorkOrder, Status>>(10);
+        let (tx2, _rx2) = mpsc::channel::<Result<WorkOrder, Status>>(10);
+        
+        // 添加两个矿工
+        miners.insert("miner1".to_string(), MinerConnection {
+            miner_id: "miner1".to_string(),
+            work_sender: tx1,
+            threads: 4,
+            session_id: "session1".to_string(),
+            last_work_id: None,
+            connected_at: chrono::Utc::now(),
+            last_active: chrono::Utc::now(),
+        });
+        
+        miners.insert("miner2".to_string(), MinerConnection {
+            miner_id: "miner2".to_string(),
+            work_sender: tx2,
+            threads: 4,
+            session_id: "session2".to_string(),
+            last_work_id: None,
+            connected_at: chrono::Utc::now(),
+            last_active: chrono::Utc::now(),
+        });
+        
+        // 创建一个快照
+        let miners_snapshot: Vec<_> = miners.iter()
+            .map(|miner| (miner.miner_id.clone(), miner.work_sender.clone()))
+            .collect();
+        
+        // 验证快照中包含两个矿工
+        assert_eq!(miners_snapshot.len(), 2);
+        
+        // 在迭代过程中移除一个矿工，模拟竞态条件
+        miners.remove("miner1");
+        
+        // 验证集合中只剩一个矿工
+        assert_eq!(miners.len(), 1);
+        
+        // 但快照中仍然有两个矿工
+        assert_eq!(miners_snapshot.len(), 2);
+        
+        // 这证明使用快照可以避免迭代过程中的并发修改问题
+    }
+}

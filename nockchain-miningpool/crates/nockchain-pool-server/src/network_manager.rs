@@ -55,23 +55,24 @@ impl NetworkManager {
         self.status_monitor = Some(status_monitor);
     }
 
-    /// 执行带有重试的异步操作
-    pub async fn retry_async_operation<F, Fut, T>(&self, operation_name: &str, operation: F) -> PoolResult<T>
+    /// 改进的重试异步操作方法，增加了更多错误处理和日志记录
+    pub async fn enhanced_retry_async_operation<F, Fut, T>(&self, operation_name: &str, operation: F) -> PoolResult<T>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<T, anyhow::Error>>,
     {
         let mut last_error = None;
+        let mut backoff_ms = self.retry_config.initial_timeout_ms;
         
         for attempt in 1..=self.retry_config.max_attempts {
             // 计算当前尝试的超时时间
             let timeout_ms = if self.retry_config.use_exponential_backoff {
-                self.retry_config.initial_timeout_ms * (2_u64.pow(attempt - 1))
+                backoff_ms
             } else {
                 self.retry_config.initial_timeout_ms
             };
             
-            debug!("执行操作 '{}' (尝试 {}/{}，超时 {}ms)",
+            info!("执行操作 '{}' (尝试 {}/{}，超时 {}ms)",
                 operation_name, attempt, self.retry_config.max_attempts, timeout_ms);
             
             // 使用超时执行操作
@@ -79,23 +80,36 @@ impl NetworkManager {
                 Ok(Ok(result)) => {
                     if attempt > 1 {
                         info!("操作 '{}' 在第 {} 次尝试后成功", operation_name, attempt);
+                    } else {
+                        debug!("操作 '{}' 首次尝试成功", operation_name);
                     }
                     return Ok(result);
                 },
                 Ok(Err(e)) => {
                     let err = PoolServerError::from_anyhow(e);
-                    warn!("操作 '{}' 失败 (尝试 {}/{}): {}", 
-                        operation_name, attempt, self.retry_config.max_attempts, err.to_log_string());
+                    
+                    // 根据错误严重程度选择日志级别
+                    match err.severity() {
+                        crate::error::ErrorSeverity::Critical | crate::error::ErrorSeverity::Error => {
+                            error!("操作 '{}' 失败 (尝试 {}/{}): {}", 
+                                operation_name, attempt, self.retry_config.max_attempts, err.to_log_string());
+                        },
+                        _ => {
+                            warn!("操作 '{}' 失败 (尝试 {}/{}): {}", 
+                                operation_name, attempt, self.retry_config.max_attempts, err.to_log_string());
+                        }
+                    }
                     
                     // 如果错误不可恢复，立即返回
                     if !err.is_recoverable() {
+                        info!("操作 '{}' 遇到不可恢复的错误，停止重试", operation_name);
                         return Err(err);
                     }
                     
                     last_error = Some(err);
                 },
                 Err(_) => {
-                    let err = PoolServerError::NetworkError(format!("操作 '{}' 超时", operation_name));
+                    let err = PoolServerError::NetworkError(format!("操作 '{}' 超时 ({}ms)", operation_name, timeout_ms));
                     warn!("{}", err.to_log_string());
                     last_error = Some(err);
                 }
@@ -104,20 +118,28 @@ impl NetworkManager {
             // 如果不是最后一次尝试，则等待一段时间后重试
             if attempt < self.retry_config.max_attempts {
                 let wait_time = if self.retry_config.use_exponential_backoff {
-                    self.retry_config.retry_interval_ms * attempt as u64
+                    // 更新下一次的退避时间
+                    let wait = self.retry_config.retry_interval_ms * attempt as u64;
+                    backoff_ms *= 2; // 指数增长
+                    wait
                 } else {
                     self.retry_config.retry_interval_ms
                 };
                 
-                debug!("等待 {}ms 后重试操作 '{}'...", wait_time, operation_name);
+                info!("等待 {}ms 后重试操作 '{}'...", wait_time, operation_name);
                 tokio::time::sleep(Duration::from_millis(wait_time)).await;
             }
         }
         
         // 所有尝试都失败，返回最后一个错误
-        Err(last_error.unwrap_or_else(|| 
+        let final_error = last_error.unwrap_or_else(|| 
             PoolServerError::NetworkError(format!("操作 '{}' 失败，未知错误", operation_name))
-        ))
+        );
+        
+        error!("操作 '{}' 在 {} 次尝试后失败: {}", 
+            operation_name, self.retry_config.max_attempts, final_error.to_log_string());
+        
+        Err(final_error)
     }
     
     /// 执行带有回退策略的操作
@@ -135,7 +157,7 @@ impl NetworkManager {
         FutB: std::future::Future<Output = Result<T, anyhow::Error>>,
     {
         // 首先尝试主操作
-        match self.retry_async_operation(primary_operation_name, primary_operation).await {
+        match self.enhanced_retry_async_operation(primary_operation_name, primary_operation).await {
             Ok(result) => Ok(result),
             Err(e) => {
                 // 主操作失败，记录错误并尝试回退操作
@@ -143,7 +165,7 @@ impl NetworkManager {
                     primary_operation_name, fallback_operation_name, e.to_log_string());
                 
                 // 执行回退操作
-                match self.retry_async_operation(fallback_operation_name, fallback_operation).await {
+                match self.enhanced_retry_async_operation(fallback_operation_name, fallback_operation).await {
                     Ok(result) => {
                         info!("回退操作 '{}' 成功", fallback_operation_name);
                         Ok(result)
@@ -292,5 +314,109 @@ impl NetworkManager {
                 }
             }
         }
+    }
+
+    /// 检查网络连接健康状态
+    pub async fn check_network_health(&self) -> PoolResult<NetworkHealthStatus> {
+        info!("检查网络连接健康状态...");
+        
+        // 测试与nockblocks.com的连接
+        let nockblocks_status = self.ping_endpoint("https://nockblocks.com").await;
+        
+        // 测试与主网节点的连接
+        let mainnet_status = self.ping_endpoint("https://p2p-mainnet.urbit.org").await;
+        
+        // 综合评估网络健康状态
+        let health_status = match (nockblocks_status.is_ok(), mainnet_status.is_ok()) {
+            (true, true) => NetworkHealthStatus::Healthy,
+            (true, false) => NetworkHealthStatus::PartiallyHealthy,
+            (false, true) => NetworkHealthStatus::PartiallyHealthy,
+            (false, false) => NetworkHealthStatus::Unhealthy,
+        };
+        
+        info!("网络健康状态: {}", health_status);
+        
+        Ok(health_status)
+    }
+}
+
+/// 网络健康状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkHealthStatus {
+    /// 健康：所有关键服务可访问
+    Healthy,
+    /// 部分健康：部分关键服务可访问
+    PartiallyHealthy,
+    /// 不健康：所有关键服务不可访问
+    Unhealthy,
+}
+
+impl std::fmt::Display for NetworkHealthStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "健康"),
+            Self::PartiallyHealthy => write!(f, "部分健康"),
+            Self::Unhealthy => write!(f, "不健康"),
+        }
+    }
+}
+
+// 添加用于测试的函数
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::PoolServerError;
+    use tokio::time::timeout;
+
+    // 测试网络重试机制
+    #[tokio::test]
+    async fn test_network_retry_mechanism() {
+        // 创建网络管理器
+        let network_manager = NetworkManager::new(RetryConfig {
+            max_attempts: 2,
+            initial_timeout_ms: 100,
+            retry_interval_ms: 50,
+            use_exponential_backoff: true,
+        });
+        
+        // 测试成功的情况
+        let success_result = network_manager.enhanced_retry_async_operation(
+            "test_success",
+            || async { Ok::<_, anyhow::Error>(42) },
+        ).await;
+        
+        assert!(success_result.is_ok());
+        assert_eq!(success_result.unwrap(), 42);
+        
+        // 测试失败后重试成功的情况
+        let mut attempt = 0;
+        let retry_success_result = network_manager.enhanced_retry_async_operation(
+            "test_retry_success",
+            || async {
+                attempt += 1;
+                if attempt == 1 {
+                    Err(anyhow::anyhow!(PoolServerError::NetworkError("测试错误".to_string())))
+                } else {
+                    Ok(42)
+                }
+            },
+        ).await;
+        
+        assert!(retry_success_result.is_ok());
+        assert_eq!(retry_success_result.unwrap(), 42);
+        
+        // 测试超时情况
+        let timeout_result = timeout(
+            std::time::Duration::from_millis(50),
+            network_manager.enhanced_retry_async_operation(
+                "test_timeout",
+                || async {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    Ok::<_, anyhow::Error>(42)
+                },
+            )
+        ).await;
+        
+        assert!(timeout_result.is_err()); // 应该超时
     }
 }
