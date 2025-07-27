@@ -335,6 +335,10 @@ pub fn make_libp2p_driver(
                             SwarmEvent::Behaviour(NockchainEvent::RequestResponse(InboundFailure { peer, error, .. })) => {
                                 log_inbound_failure(peer, error, metrics.clone());
                             }
+                            SwarmEvent::Behaviour(NockchainEvent::Ping(e)) => {
+                                // TODO: 暂时跳过ping事件的细分处理，等待确认正确的Event变体类型
+                                trace!("SEvent: Ping event received: {:?}", e);
+                            },
                             SwarmEvent::OutgoingConnectionError { error, .. } => {
                                 log_dial_error(error);
                             },

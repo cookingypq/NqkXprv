@@ -70,6 +70,8 @@ pub struct MessageTracker {
     pub first_negative: u64,
     pub seen_tx_clear_interval: u64,
     pub last_tx_cache_clear_height: u64,
+    // Track failed pings per peer
+    failed_pings_by_peer: BTreeMap<PeerId, u64>,
 }
 
 impl MessageTracker {
@@ -92,6 +94,7 @@ impl MessageTracker {
             first_negative: 0,
             seen_tx_clear_interval,
             last_tx_cache_clear_height: 0,
+            failed_pings_by_peer: BTreeMap::new(),
         }
     }
 
@@ -230,6 +233,9 @@ impl MessageTracker {
                 self.block_id_to_peers.remove(&block_id);
             }
         }
+
+        // Clean up ping failure tracking
+        self.remove_failed_ping_tracking(peer_id);
     }
 
     /// Adds a block ID and peer to the tracker.
@@ -363,6 +369,29 @@ impl MessageTracker {
                 }
             }
         }
+    }
+
+    /// Record a failed ping for a peer
+    pub fn record_failed_ping(&mut self, peer_id: PeerId) {
+        let failed_count = self.failed_pings_by_peer.entry(peer_id).or_insert(0);
+        *failed_count += 1;
+        trace!("Recorded failed ping for peer {}: {} failed pings", peer_id, failed_count);
+    }
+
+    /// Get the number of failed pings for a peer
+    pub fn get_failed_pings(&self, peer_id: &PeerId) -> u64 {
+        self.failed_pings_by_peer.get(peer_id).copied().unwrap_or(0)
+    }
+
+    /// Clear failed ping count for a peer (e.g., after successful ping)
+    pub fn clear_failed_pings(&mut self, peer_id: &PeerId) {
+        self.failed_pings_by_peer.remove(peer_id);
+        trace!("Cleared failed ping count for peer {}", peer_id);
+    }
+
+    /// Remove a peer from failed ping tracking
+    pub fn remove_failed_ping_tracking(&mut self, peer_id: &PeerId) {
+        self.failed_pings_by_peer.remove(peer_id);
     }
 }
 
