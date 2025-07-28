@@ -36,7 +36,8 @@ use tracing::{debug, error, info, instrument, trace, warn};
 
 use crate::config::LibP2PConfig;
 use crate::metrics::NockchainP2PMetrics;
-use crate::p2p::*;
+use crate::behaviour::*;
+use crate::messages::{NockchainRequest, NockchainResponse};
 use crate::p2p_util::{
     log_fail2ban_ipv4, log_fail2ban_ipv6, CacheResponse, MessageTracker, NockchainDataRequest,
     NockchainFact, PeerIdExt,
@@ -195,21 +196,44 @@ pub fn make_libp2p_driver(
             let seen_tx_clear_interval = libp2p_config.seen_tx_clear_interval();
             let min_peers = libp2p_config.min_peers();
             let poke_timeout = libp2p_config.poke_timeout();
-            let mut swarm = match crate::p2p::start_swarm(
-                libp2p_config, keypair, bind, allowed, limits, memory_limits,
-            ) {
-                Ok(swarm) => swarm,
-                Err(e) => {
+            let (resolver_config, resolver_opts) =
+                if let Ok(sys) = hickory_resolver::system_conf::read_system_conf() {
+                    debug!("resolver configs and opts: {:?}", sys);
+                    sys
+                } else {
+                    (hickory_resolver::config::ResolverConfig::cloudflare(), hickory_resolver::config::ResolverOpts::default())
+                };
+
+            let max_idle_timeout_millisecs = libp2p_config.max_idle_timeout_millisecs();
+            let keep_alive_interval = libp2p_config.keep_alive_interval();
+            let handshake_timeout = libp2p_config.handshake_timeout();
+            let connection_timeout = libp2p_config.connection_timeout();
+            let swarm_idle_timeout = libp2p_config.swarm_idle_timeout();
+            let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
+                .with_tokio()
+                .with_quic_config(|mut cfg| {
+                    cfg.max_idle_timeout = max_idle_timeout_millisecs;
+                    cfg.keep_alive_interval = keep_alive_interval;
+                    cfg.handshake_timeout = handshake_timeout;
+                    cfg
+                })
+                .with_dns_config(resolver_config, resolver_opts)
+                .with_behaviour(crate::behaviour::NockchainBehaviour::pre_new(
+                    libp2p_config, allowed, limits, memory_limits,
+                ))
+                .map_err(|e| {
                     error!("Could not create swarm: {}", e);
-                    let (_, handle_clone) = handle.dup();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_clone.exit.exit(1).await {
-                            error!("Failed to send exit signal: {}", e);
-                        }
-                    });
-                    return Err(NockAppError::OtherError);
+                    NockAppError::OtherError
+                })?
+                .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(swarm_idle_timeout))
+                .with_connection_timeout(connection_timeout)
+                .build();
+
+            for bind_addr in bind {
+                if let Err(e) = swarm.listen_on(bind_addr.clone()) {
+                    error!("Failed to listen on {bind_addr:?}: {e}");
                 }
-            };
+            }
             let (swarm_tx, mut swarm_rx) = mpsc::channel::<SwarmAction>(1000); // number needs to be high enough to send gossips to peers
             let mut join_set = TrackedJoinSet::<Result<(), NockAppError>>::new();
             let message_tracker = Arc::new(Mutex::new(MessageTracker::new(
@@ -283,7 +307,15 @@ pub fn make_libp2p_driver(
                             },
                             SwarmEvent::Behaviour(NockchainEvent::Identify(Received { connection_id: _, peer_id, info })) => {
                                 trace!("SEvent: identify_received");
-                                identify_received(&mut swarm, peer_id, info)?;
+                                swarm.add_external_address(info.observed_addr.clone());
+                                let us = *swarm.local_peer_id();
+                                let kad = &mut swarm.behaviour_mut().kad;
+                                trace!("Adding address {} for us: {}", info.observed_addr, us);
+                                kad.add_address(&us, info.observed_addr);
+                                for addr in info.listen_addrs {
+                                    trace!("Adding address {} for peer {}", addr, peer_id);
+                                    kad.add_address(&peer_id, addr);
+                                }
                             },
                             SwarmEvent::ConnectionEstablished { connection_id, peer_id, endpoint, .. } => {
                                 message_tracker.lock().await.track_connection(connection_id, peer_id, endpoint.get_remote_address(), endpoint.clone());
@@ -439,19 +471,6 @@ pub fn make_libp2p_driver(
     })
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-/// Network struct (in serde/CBOR) for requests
-pub enum NockchainRequest {
-    /// Request a block or TX from another node, carry PoW
-    Request {
-        pow: equix::SolutionByteArray,
-        nonce: u64,
-        message: ByteBuf,
-    },
-    /// Gossip a block or TX to another node
-    Gossip { message: ByteBuf },
-}
-
 impl NockchainRequest {
     /// Make a new "request" which gossips a block or a TX
     fn new_gossip(message: &NounSlab) -> NockchainRequest {
@@ -536,15 +555,6 @@ impl NockchainRequest {
             NockchainRequest::Gossip { message: _ } => Ok(()),
         }
     }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-/// Responses to Nockchain requests
-pub enum NockchainResponse {
-    /// The requested block or raw-tx
-    Result { message: ByteBuf },
-    /// If the request was a gossip, no actual response is needed
-    Ack { acked: bool },
 }
 
 impl NockchainResponse {
