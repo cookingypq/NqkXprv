@@ -139,7 +139,7 @@ impl MessageTracker {
     pub(crate) fn prune_inbound_connections(
         &mut self,
         metrics: Arc<NockchainP2PMetrics>,
-        swarm: &mut Swarm<crate::p2p::NockchainBehaviour>,
+        swarm: &mut Swarm<crate::behaviour::NockchainBehaviour>,
         prune_n: usize,
     ) {
         let mut inbound_connections_vec = self
