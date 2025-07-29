@@ -1,0 +1,2 @@
+*.jam filter=lfs diff=lfs merge=lfs -text
+*.pill filter=lfs diff=lfs merge=lfs -text
