@@ -39,7 +39,7 @@ pool-server:
 .PHONY: miner
 miner: build-hoon-all
 	@echo "构建矿工（矿池模式）... | Building miner (pool mode)..."
-	@cargo build --release -p nockchain --features pool_client
+	@cargo build --release -p nockchain 
 
 # 构建矿池服务器和矿工客户端 | Build pool server and miner client
 .PHONY: pool-full
@@ -165,7 +165,7 @@ install-hoonc:
 .PHONY: install-nockchain
 install-nockchain: assets/dumb.jam assets/miner.jam
 	@echo "安装nockchain（矿工客户端）... | Installing nockchain (miner client)..."
-	@cargo install --locked --force --path crates/nockchain --bin miner --features pool_client
+	@cargo install --locked --force --path crates/nockchain --bin miner 
 
 # 安装矿池服务器 | Install pool server
 .PHONY: install-pool-server
