@@ -55,12 +55,7 @@ main()
 │                   │   └── Regular expression parsing of "Latest Block" number
 │                   └── estimate_network_height() (fallback method)
 │                       └── current_height + 10 (estimate)
-```
-
-### Periodic Tasks
-
-#### Blockchain Status Check (every 10 seconds)
-```
+│
 ├── get_current_block_id()
 │   └── peek [%heavy ~] Get current block ID
 ├── Compare block ID changes
