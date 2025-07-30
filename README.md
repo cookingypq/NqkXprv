@@ -64,17 +64,17 @@ main()
 │   ├── update_block_height()
 │   └── update_network_block_height()
 └── Generate new work task
-    ├── generate_work()
-    │   └── get_chain_state()
-    │       ├── peek [%heavy ~] Get latest block ID
-    │       ├── peek [%block <block-id> ~] Get block page
-    │       ├── Parse block height, target difficulty, parent block hash
-    │       └── Calculate Merkle root
-    └── broadcast_work() broadcast to all miners
-```
-
-#### Network Height Check (every 60 seconds)
-```
+│   ├── generate_work()
+│   │   └── get_chain_state()
+│   │       ├── peek [%heavy ~] Get latest block ID
+│   │       ├── peek [%block <block-id> ~] Get block page
+│   │       ├── Parse block height, target difficulty, parent block hash
+│   │       └── Calculate Merkle root
+│   └── broadcast_work() broadcast to all miners
+│
+│
+│-- Network Height Check (every 60 seconds)
+│
 └── try_get_latest_network_height()
     └── network_manager.get_latest_network_height()
 ```
